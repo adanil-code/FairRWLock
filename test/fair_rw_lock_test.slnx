@@ -1,0 +1,8 @@
+<Solution>
+  <Configurations>
+    <Platform Name="ARM64" />
+    <Platform Name="x64" />
+    <Platform Name="x86" />
+  </Configurations>
+  <Project Path="fair_rw_lock_test.vcxproj" Id="1bc16489-eebc-46d2-82cd-621531f552b3" />
+</Solution>
