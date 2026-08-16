@@ -32,14 +32,27 @@
 #include "textbook_reader_pref_lock.h"
 #include "momentum_rw_lock.h"
 
+// ----------------------------------------------------------------------------
+// NUMA Test Configuration Bridge
+// Dynamically maps the ENABLE_NUMA preprocessor macro into the 
+// FairRWLock template parameter across the entire test suite.
+// ----------------------------------------------------------------------------
+#ifdef ENABLE_NUMA
+constexpr bool USE_NUMA_CONFIG = true;
+#else
+constexpr bool USE_NUMA_CONFIG = false;
+#endif
+
+template <typename Policy = DefaultFairRWLockPolicy>
+using TestFairRWLock = FairRWLock<Policy, USE_NUMA_CONFIG>;
+
 // --- Platform & Architecture Specific ---
 #if !defined(_WIN32)
-    // POSIX (Linux, macOS)
+// POSIX (Linux, macOS)
 #include <sys/resource.h>
 #endif
 
 #ifdef _WIN32
-#define NOMINMAX
 #include <windows.h>
 #pragma comment(lib, "Winmm.lib")
 #endif
@@ -85,7 +98,7 @@ static unsigned int get_hw_threads()
 // ----------------------------------------------------------------------------
 void reader_writer_race_test()
 {
-    FairRWLock<> lock;
+    TestFairRWLock<> lock;
     std::atomic<int> readers_inside = 0;
     std::atomic<int> writers_inside = 0;
     std::atomic<bool> ok{true};
@@ -150,7 +163,7 @@ void reader_writer_race_test()
 // ----------------------------------------------------------------------------
 void writer_timeout_with_readers()
 {
-    FairRWLock<> lock;
+    TestFairRWLock<> lock;
     std::atomic<bool> timed_out = false;
 
     lock.ReadLock();
@@ -180,7 +193,7 @@ void writer_timeout_with_readers()
 // ----------------------------------------------------------------------------
 void reader_timeout_with_writer()
 {
-    FairRWLock<> lock;
+    TestFairRWLock<> lock;
     std::atomic<bool> timed_out = false;
 
     lock.WriteLock();
@@ -210,7 +223,7 @@ void reader_timeout_with_writer()
 // ----------------------------------------------------------------------------
 void try_lock_under_contention_test()
 {
-    FairRWLock<> lock;
+    TestFairRWLock<> lock;
     bool ok = true;
     
     lock.WriteLock();
@@ -274,11 +287,11 @@ void try_lock_under_contention_test()
 // ----------------------------------------------------------------------------
 void raii_guard_functionality_test()
 {
-    FairRWLock<> lock;
+    TestFairRWLock<> lock;
     bool ok = true;
 
     {
-        FairRWLock<>::WriteGuard g(lock);
+        TestFairRWLock<>::WriteGuard g(lock);
         
         if (lock.TryReadLock())
         {
@@ -296,8 +309,8 @@ void raii_guard_functionality_test()
     }
 
     {
-        FairRWLock<>::WriteGuard g1(lock);
-        FairRWLock<>::WriteGuard g2(std::move(g1));
+        TestFairRWLock<>::WriteGuard g1(lock);
+        TestFairRWLock<>::WriteGuard g2(std::move(g1));
         
         if (!g2)
         {
@@ -308,7 +321,7 @@ void raii_guard_functionality_test()
     lock.WriteLock();
     
     {
-        FairRWLock<>::ReadGuard g(lock, 50ms);
+        TestFairRWLock<>::ReadGuard g(lock, 50ms);
         
         if (g)
         {
@@ -341,7 +354,7 @@ struct PunchesThroughPolicy : DefaultFairRWLockPolicy
 // ----------------------------------------------------------------------------
 void writer_punches_through_readers_test()
 {
-    FairRWLock<PunchesThroughPolicy> lock;
+    TestFairRWLock<PunchesThroughPolicy> lock;
     std::latch all_readers_in(5);
     std::promise<void> release_p;
     auto release = release_p.get_future().share();
@@ -414,7 +427,7 @@ struct OverrideResetPolicy : DefaultFairRWLockPolicy
 // ----------------------------------------------------------------------------
 void override_reset_test()
 {
-    FairRWLock<OverrideResetPolicy> lock;
+    TestFairRWLock<OverrideResetPolicy> lock;
     std::atomic<bool> reader_succeeded = false;
     std::promise<void> writer_batch_done_p;
     auto writer_batch_done_f = writer_batch_done_p.get_future();
@@ -489,7 +502,7 @@ struct ConsecLimitPolicy : DefaultFairRWLockPolicy
 // ----------------------------------------------------------------------------
 void consecutive_limit_breaks_batch_test()
 {
-    FairRWLock<ConsecLimitPolicy> lock;
+    TestFairRWLock<ConsecLimitPolicy> lock;
     std::atomic<int> order{0};
     std::atomic<bool> reader_acquired{false};
 
@@ -544,7 +557,7 @@ void consecutive_limit_breaks_batch_test()
 // ----------------------------------------------------------------------------
 void writer_timeout_handoff_test()
 {
-    FairRWLock<> lock;
+    TestFairRWLock<> lock;
     std::atomic<bool> w2_done = false;
 
     lock.ReadLock();
@@ -585,7 +598,7 @@ void writer_timeout_handoff_test()
 // ----------------------------------------------------------------------------
 void mid_queue_timeout_test()
 {
-    FairRWLock<> lock;
+    TestFairRWLock<> lock;
     std::atomic<int> acquire_count{0};
     
     lock.ReadLock();
@@ -657,7 +670,7 @@ struct OverrideTimeslicePolicy : DefaultFairRWLockPolicy
 // ----------------------------------------------------------------------------
 void override_timeslice_allows_reader_test()
 {
-    FairRWLock<OverrideTimeslicePolicy> lock;
+    TestFairRWLock<OverrideTimeslicePolicy> lock;
     std::atomic<int> order{0};
     std::atomic<bool> reader_got_in{false};
 
@@ -735,7 +748,7 @@ void override_timeslice_allows_reader_test()
 // ----------------------------------------------------------------------------
 void multiple_writers_fairness_test()
 {
-    FairRWLock<> lock;
+    TestFairRWLock<> lock;
     std::atomic<int> successes = 0;
     std::vector<std::thread> writers;
     
@@ -766,7 +779,7 @@ void multiple_writers_fairness_test()
 // ----------------------------------------------------------------------------
 void stress_liveness_test()
 {
-    FairRWLock<> lock;
+    TestFairRWLock<> lock;
     const unsigned int hw_threads = get_hw_threads();
     const int num_threads = std::max<int>(10u, hw_threads * 2); 
     const int ops_per_thread = 300;
@@ -859,7 +872,7 @@ struct NonRecursivePolicy : DefaultFairRWLockPolicy
 // ----------------------------------------------------------------------------
 void non_recursive_reader_test()
 {
-    FairRWLock<NonRecursivePolicy> lock;
+    TestFairRWLock<NonRecursivePolicy> lock;
     std::atomic<bool> ok{true};
     std::promise<void> writer_queued;
     auto writer_f = writer_queued.get_future();
@@ -897,7 +910,7 @@ void non_recursive_reader_test()
 // ----------------------------------------------------------------------------
 void zero_timeout_edge_case_test()
 {
-    FairRWLock<> lock;
+    TestFairRWLock<> lock;
     bool ok = true;
 
     if (!lock.WriteLock(0s))
@@ -948,7 +961,7 @@ void zero_timeout_edge_case_test()
 // ----------------------------------------------------------------------------
 void reader_thundering_herd_test()
 {
-    FairRWLock<> lock;
+    TestFairRWLock<> lock;
     std::atomic<int> readers_in = 0;
     std::atomic<bool> writer_done = false;
     
@@ -1005,7 +1018,7 @@ struct StrictBatchPolicy : DefaultFairRWLockPolicy
 // ----------------------------------------------------------------------------
 void strict_writer_batch_limit_test()
 {
-    FairRWLock<StrictBatchPolicy> lock;
+    TestFairRWLock<StrictBatchPolicy> lock;
     std::atomic<int> execution_order = 0;
     std::atomic<int> reader_position = 0;
 
@@ -1075,13 +1088,13 @@ void strict_writer_batch_limit_test()
 // ----------------------------------------------------------------------------
 void guard_move_assignment_test()
 {
-    FairRWLock<> lock1;
-    FairRWLock<> lock2;
+    TestFairRWLock<> lock1;
+    TestFairRWLock<> lock2;
     bool ok = true;
 
     {
-        FairRWLock<>::WriteGuard g1(lock1);
-        FairRWLock<>::WriteGuard g2(lock2);
+        TestFairRWLock<>::WriteGuard g1(lock1);
+        TestFairRWLock<>::WriteGuard g2(lock2);
 
         g1 = std::move(g2);
 
@@ -1119,7 +1132,7 @@ void guard_move_assignment_test()
 // ----------------------------------------------------------------------------
 void max_duration_overflow_test()
 {
-    FairRWLock<> lock;
+    TestFairRWLock<> lock;
     bool ok = true;
     
     lock.WriteLock();
@@ -1130,7 +1143,7 @@ void max_duration_overflow_test()
     {
         reader_started = true;
         
-        if (!lock.ReadLock(std::chrono::steady_clock::duration::max()))
+        if (!lock.ReadLock(((std::chrono::steady_clock::duration::max)())))
         {
             ok = false;
         }
@@ -1321,7 +1334,7 @@ void run_comparative_throughput_test()
 
     // 1. FairRWLock (Our atomic fast-path lock)
     std::cout << "  -> Running FairRWLock (Custom Fairness Policy)..." << std::endl;
-    FairRWLock<> fair_lock;
+    TestFairRWLock<> fair_lock;
     WorkloadResult fair_results = run_workload([&] { fair_lock.ReadLock(); },
                                                [&] { fair_lock.ReadUnlock(); },
                                                [&] { fair_lock.WriteLock(); },
@@ -1349,9 +1362,9 @@ void run_comparative_throughput_test()
     // 4. Momentum Lock (Naive Priority Batching example)
     std::cout << "  -> Running MomentumRWLock (Naive Priority Batching Fix)..." << std::endl;
     MomentumRWLock mom_lock;
-    WorkloadResult mom_results = run_workload([&] { mom_lock.ReadLock(INFINITE); },
+    WorkloadResult mom_results = run_workload([&] { mom_lock.ReadLock(INFINITE_TIME); },
                                               [&] { mom_lock.ReadUnlock(); },
-                                              [&] { mom_lock.WriteLock(INFINITE); },
+                                              [&] { mom_lock.WriteLock(INFINITE_TIME); },
                                               [&] { mom_lock.WriteUnlock(); },
                                               "MomentumRWLock");
 
@@ -1467,11 +1480,11 @@ struct AdapterPolicy : DefaultFairRWLockPolicy
 
 struct FairLockAdapter
 {
-    std::unique_ptr<FairRWLock<AdapterPolicy>> lock;
+    std::unique_ptr<TestFairRWLock<AdapterPolicy>> lock;
     
     FairLockAdapter()
     {
-        lock = std::make_unique<FairRWLock<AdapterPolicy>>();
+        lock = std::make_unique<TestFairRWLock<AdapterPolicy>>();
     }
     
     void lock_shared() 
@@ -1526,7 +1539,7 @@ struct MomentumLockAdapter
     
     void lock_shared() 
     { 
-        lock.ReadLock(INFINITE); 
+        lock.ReadLock(INFINITE_TIME); 
     }
     
     void unlock_shared() 
@@ -2063,25 +2076,25 @@ void policy_parameter_sweep_benchmark()
 
     std::vector<SweepResult> results;
 
-    FairRWLock<DefaultFairRWLockPolicy> def_lock;
+    TestFairRWLock<DefaultFairRWLockPolicy> def_lock;
     results.push_back(run_fair_lock(def_lock, 
                                     "1. Default Baseline", 
                                     "starveThresh=3ms, maxWait=50ms, overrideTime=100ms, batchLimit=2, consecWriters=0",
                                     DESC_DEFAULT));
 
-    FairRWLock<ReaderOptPolicy> reader_lock;
+    TestFairRWLock<ReaderOptPolicy> reader_lock;
     results.push_back(run_fair_lock(reader_lock, 
                                     "2. Reader-Biased (High Throughput)", 
                                     "starveThresh=50ms, maxWait=200ms, overrideTime=100ms, batchLimit=2, consecWriters=0",
                                     DESC_READER_BIASED));
 
-    FairRWLock<StrictOptPolicy> strict_lock;
+    TestFairRWLock<StrictOptPolicy> strict_lock;
     results.push_back(run_fair_lock(strict_lock, 
                                     "3. Reader-Strict (Single-Write Cap)", 
                                     "starveThresh=1ms, maxWait=10ms, overrideTime=100ms, batchLimit=1, consecWriters=1",
                                     DESC_READER_STRICT));
 
-    FairRWLock<WriterOptPolicy> writer_lock;
+    TestFairRWLock<WriterOptPolicy> writer_lock;
     results.push_back(run_fair_lock(writer_lock, 
                                     "4. Writer-Prioritized Burst", 
                                     "starveThresh=2ms, maxWait=20ms, overrideTime=200ms, batchLimit=10, consecWriters=0",
@@ -2106,9 +2119,9 @@ void policy_parameter_sweep_benchmark()
                                    DESC_TEXTBOOK));
                                    
     MomentumRWLock mom_sweep_lock;
-    results.push_back(run_workload([&] { mom_sweep_lock.ReadLock(INFINITE); }, 
+    results.push_back(run_workload([&] { mom_sweep_lock.ReadLock(INFINITE_TIME); }, 
                                    [&] { mom_sweep_lock.ReadUnlock(); },
-                                   [&] { mom_sweep_lock.WriteLock(INFINITE); }, 
+                                   [&] { mom_sweep_lock.WriteLock(INFINITE_TIME); }, 
                                    [&] { mom_sweep_lock.WriteUnlock(); },
                                    "7. Momentum (Batching Fix)", 
                                    "N/A (Momentum-based priority flip-flops)",
@@ -2167,14 +2180,14 @@ struct ConsecHammerPolicy : DefaultFairRWLockPolicy
 // ----------------------------------------------------------------------------
 void consecutive_limit_hammer_test()
 {
-    FairRWLock<ConsecHammerPolicy> lock;
+    TestFairRWLock<ConsecHammerPolicy> lock;
     std::atomic<bool> running{true};
     std::atomic<int> consec_writes{0};
     std::atomic<int> max_consec_writes{0};
     std::atomic<bool> limit_breached{false};
 
     const unsigned int hw_threads = get_hw_threads();
-    const int NUM_THREADS = std::max(4u, hw_threads * 2); 
+    const int NUM_THREADS = std::max<int>(4u, hw_threads * 2); 
     std::barrier sync(NUM_THREADS * 2 + 1);
 
     auto writer_task = [&]()
@@ -2268,7 +2281,7 @@ struct OverrideStarveHammerPolicy : DefaultFairRWLockPolicy
 // ----------------------------------------------------------------------------
 void override_starvation_hammer_test()
 {
-    FairRWLock<OverrideStarveHammerPolicy> lock;
+    TestFairRWLock<OverrideStarveHammerPolicy> lock;
     std::atomic<bool> running{true};
     std::atomic<bool> writer_starved{false};
 
@@ -2541,6 +2554,7 @@ int main()
 
     std::cout << "\n=========================================================\n";
     std::cout << "    CPU: " << cpu_name() << "\n";
+    std::cout << "    NUMA Configuration: " << (USE_NUMA_CONFIG ? "Enabled (Distributed Counters)" : "Disabled (Centralized Fast-Path)") << "\n";
     std::cout << "=========================================================\n";    
 
     set_high_priority();
@@ -2594,7 +2608,7 @@ int main()
 
     bool all_checks_passed = true;
 
-    FairRWLock<PersistencePolicy> lock;
+    TestFairRWLock<PersistencePolicy> lock;
 
     SharedData shared_data;
     std::atomic<long> read_operations  = 0;
@@ -2608,7 +2622,7 @@ int main()
 
     for (int i = 0; i < NUM_READERS; ++i)
     {
-        threads.emplace_back(reader_task<FairRWLock<PersistencePolicy>>, 
+        threads.emplace_back(reader_task<TestFairRWLock<PersistencePolicy>>, 
                              std::ref(lock), 
                              std::ref(shared_data), 
                              std::ref(read_operations), 
@@ -2618,7 +2632,7 @@ int main()
 
     for (int i = 0; i < NUM_WRITERS; ++i)
     {
-        threads.emplace_back(writer_task<FairRWLock<PersistencePolicy>>, 
+        threads.emplace_back(writer_task<TestFairRWLock<PersistencePolicy>>, 
                              std::ref(lock), 
                              std::ref(shared_data), 
                              std::ref(write_operations), 

@@ -1,5 +1,9 @@
 <Solution>
   <Configurations>
+    <BuildType Name="Debug" />
+    <BuildType Name="Debug-NUMA" />
+    <BuildType Name="Release" />
+    <BuildType Name="Release-NUMA" />
     <Platform Name="ARM64" />
     <Platform Name="x64" />
     <Platform Name="x86" />

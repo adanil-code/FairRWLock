@@ -16,14 +16,38 @@
 
 #include <algorithm>
 #include <atomic>
+#include <bit>
 #include <cassert>
 #include <chrono>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <semaphore>
 #include <string_view>
 #include <thread>
+#include <vector>
+
+#if defined(_WIN32)
+#include <windows.h>
+#elif defined(__linux__)
+#include <sched.h>
+// ----------------------------------------------------------------------------
+// Linux NUMA Forward Declarations
+// If EnableNUMA = false, the compiler discards the if constexpr branches 
+// invoking these, allowing compilation without installing libnuma-dev or 
+// linking -lnuma.
+// ----------------------------------------------------------------------------
+struct bitmask;
+extern "C" 
+{
+    int numa_available(void);
+    int numa_max_node(void);
+    int numa_bitmask_isbitset(const struct bitmask*, int);
+    int numa_node_of_cpu(int);
+    extern struct bitmask* numa_all_nodes_ptr;
+}
+#endif
 
 #ifndef NDEBUG
 #include <sstream>
@@ -78,6 +102,136 @@ constexpr size_t CACHE_LINE_SIZE = 128;
 #else        
 constexpr size_t CACHE_LINE_SIZE = 64;
 #endif
+
+// -------------------------------------------------------------------------
+// NUMA Topology Discovery & Caching
+// Encapsulated within a strict templated struct. Ensures topology evaluation 
+// metadata resides in global read-only memory, guaranteeing zero false-sharing
+// with individual lock instances.
+// -------------------------------------------------------------------------
+template <bool EnableNUMA>
+struct NumaTopology
+{
+    static const std::vector<uint32_t>& GetValidNodes() noexcept
+    {
+        static const std::vector<uint32_t> validNodes = []()
+        {
+            if constexpr (EnableNUMA)
+            {
+                try
+                {
+                    std::vector<uint32_t> nodes;
+
+#if defined(_WIN32)
+                    ULONG highestNode = 0;
+
+                    if (GetNumaHighestNodeNumber(&highestNode)) [[likely]]
+                    {
+                        const USHORT maxNode = static_cast<USHORT>(highestNode);
+
+                        for (USHORT i = 0; i <= maxNode; ++i)
+                        {
+                            ULONGLONG availableMemory = 0;
+                            
+                            if (GetNumaAvailableMemoryNodeEx(i, &availableMemory))
+                            {
+                                nodes.push_back(i);
+                            }
+                        }
+                    }
+#elif defined(__linux__)
+                    if (numa_available() >= 0) [[likely]]
+                    {
+                        int highestNode = numa_max_node();
+
+                        for (int i = 0; i <= highestNode; ++i)
+                        {
+                            if (numa_bitmask_isbitset(numa_all_nodes_ptr, i))
+                            {
+                                nodes.push_back(i);
+                            }
+                        }
+                    }
+#endif
+                    if (nodes.empty()) [[unlikely]]
+                    {
+                        nodes.push_back(0);
+                    }
+
+                    nodes.shrink_to_fit();
+                    
+                    return nodes;
+                }
+                catch (...)
+                {
+                    // Returns a static fallback to strictly prevent dangling reference UB
+                    static const std::vector<uint32_t> fallback{ 0 };                    
+                    return fallback;
+                }
+            }
+            else
+            {
+                static const std::vector<uint32_t> fallback{ 0 };
+                return fallback;
+            }
+        }();
+
+        return validNodes;
+    }
+
+    static inline const bool   is_multi_node = EnableNUMA ? (GetValidNodes().size() > 1) : false;
+    // Guaranteed to be a power of 2 for zero-cost bitwise modulo operations
+    static inline const size_t num_stripes   = EnableNUMA ? std::bit_ceil(GetValidNodes().size()) : 1;
+};
+
+// -------------------------------------------------------------------------
+// Conditionally Compiled NUMA Storage
+// Over-aligned stripes to eliminate reader fast-path cache line bouncing.
+// -------------------------------------------------------------------------
+template <bool Enable>
+struct NumaStorage;
+
+// Zero-overhead state when EnableNUMA = false (0 bytes)
+template <>
+struct NumaStorage<false> 
+{
+    inline void init(bool, size_t) noexcept 
+    {
+    }
+};
+
+// Distributed Node Arrays when EnableNUMA = true
+template <>
+struct NumaStorage<true>
+{
+    struct alignas(CACHE_LINE_SIZE) ReaderStripe 
+    {
+        std::atomic<uint32_t> count{ 0 };
+        
+        ReaderStripe() noexcept : count(0) 
+        {
+        }
+    };
+    
+    std::unique_ptr<ReaderStripe[]> stripes;
+
+    // Defers allocation dynamically. If only 1 node is detected at startup, 
+    // it skips array allocation entirely to conserve L1/L2 cache capacity.
+    inline void init(bool is_multi_node, size_t num_stripes) 
+    {
+        if (is_multi_node) 
+        {
+            stripes = std::make_unique<ReaderStripe[]>(num_stripes);
+        }
+    }
+    
+    NumaStorage() = default;
+    NumaStorage(const NumaStorage&) = delete;
+    NumaStorage& operator=(const NumaStorage&) = delete;
+    
+    NumaStorage(NumaStorage&&) noexcept = default;
+    NumaStorage& operator=(NumaStorage&&) noexcept = default;
+};
 
 // -------------------------------------------------------------------------
 // Default Fairness Policy Traits
@@ -140,13 +294,20 @@ struct DefaultFairRWLockPolicy
 //    Once the current active readers finish, the lock "hands the baton" to the 
 //    starved writer.
 //
-// Ideal Use Cases:
+// 4. NUMA-Aware Distributed Readers (Optional):
+//    When EnableNUMA is true and multiple CPU sockets are detected, the lock 
+//    distributes reader counts across over-aligned stripe arrays. Fast-path 
+//    readers exclusively increment their localized stripe, eliminating 
+//    cache-line bouncing on the central state interconnect. Writers assert a 
+//    global barricade and dynamically drain the distributed counts.
+//
+// Recommended Use Cases:
 // - High-frequency trading order books.
 // - ETW/EDR or telemetry pipelines where millions of read events occur, but 
 //   configuration updates (writes) must not be starved.
 // - Centralized routing tables or subscriber lists in highly concurrent backends.
 // -------------------------------------------------------------------------
-template <typename Policy = DefaultFairRWLockPolicy>
+template <typename Policy = DefaultFairRWLockPolicy, bool EnableNUMA = false>
 class FairRWLock
 {
 public:
@@ -155,7 +316,13 @@ public:
     using time_point = clock::time_point;
     using LoggerFn   = std::function<void(std::string_view)>;
 
-    FairRWLock() = default;
+    FairRWLock() 
+    {
+        if constexpr (EnableNUMA)
+        {
+            m_numaState.init(NumaTopology<EnableNUMA>::is_multi_node, NumaTopology<EnableNUMA>::num_stripes);
+        }
+    }
 
 #ifndef NDEBUG
     // Assigns an optional diagnostic logger for debugging lock state transitions.
@@ -202,7 +369,7 @@ public:
     {
     public:
         // Attempts to acquire a read lock, optionally bound by a timeout.
-        explicit ReadGuard(FairRWLock& l, duration timeout = duration::max()) : m_lock(&l)
+        explicit ReadGuard(FairRWLock& l, duration timeout = (duration::max)()) : m_lock(&l)
         {
             m_locked = m_lock->ReadLock(timeout);
         }
@@ -264,7 +431,7 @@ public:
     {
     public:
         // Attempts to acquire an exclusive write lock, optionally bound by a timeout.
-        explicit WriteGuard(FairRWLock& l, duration timeout = duration::max()) : m_lock(&l)
+        explicit WriteGuard(FairRWLock& l, duration timeout = (duration::max)()) : m_lock(&l)
         {
             m_locked = m_lock->WriteLock(timeout);
         }
@@ -331,15 +498,59 @@ public:
     // expires.
     // Returns true on success, false if the timeout was reached.
     // -------------------------------------------------------------------------
-    bool ReadLock(duration timeout = duration::max())
+    bool ReadLock(duration timeout = (duration::max)())
     {
+        if constexpr (EnableNUMA)
+        {
+            // Dynamically bypasses distributed logic when running strictly on a single node
+            if (NumaTopology<EnableNUMA>::is_multi_node) 
+            {
+                size_t idx = get_stripe_index();
+                
+                // memory_order_seq_cst enforces strict Store-Load ordering across ARM/PowerPC
+                m_numaState.stripes[idx].count.fetch_add(1, 
+                                                         std::memory_order_seq_cst);
+                                
+                uint64_t s = m_state.load(std::memory_order_seq_cst);
+
+                // Fast Path: Only successfully acquired if no writers are active/starving.
+                if ((s & (WRITE_LOCKED | WRITER_STARVING)) == 0) [[likely]]
+                {
+                    if ((s >> 32) > 0) [[unlikely]]
+                    {                
+                        m_state.fetch_and(STATE_MASK, 
+                                          std::memory_order_relaxed);
+                    }
+                    
+                    return true;
+                }
+
+                // Rollback the speculative local increment with SeqCst to avoid 
+                // the 0-observation distributed counter anomaly.
+                uint32_t old_c = m_numaState.stripes[idx].count.fetch_sub(1, 
+                                                                          std::memory_order_seq_cst);
+                
+                if (old_c == 1 && get_total_readers() == 0)
+                {                    
+                    uint64_t current_s = m_state.load(std::memory_order_seq_cst);
+                    
+                    if ((current_s & HAS_WAITERS) && !(current_s & WRITE_LOCKED)) [[unlikely]]
+                    {
+                        slow_read_unlock();
+                    }
+                }
+
+                return slow_read_lock(timeout);
+            }
+        }
+
         // Lock-Free Acquisition: Bypasses CAS loops for O(N) throughput.
-        // Hardware unconditionally resolves parallel fetches immediately.
+        // Hardware unconditionally resolves parallel fetches immediately.        
         uint64_t s = m_state.fetch_add(READ_INC,
                                        std::memory_order_acquire);
 
-        // Guard against reader count overflow (28 bits maximum).
-        if ((s & READ_MASK) == READ_MASK) [[unlikely]]
+        // Guard against bitmask overflow into state flags
+        if ((s & OVERFLOW_GUARD) != 0) [[unlikely]]
         {
             m_state.fetch_sub(READ_INC,
                               std::memory_order_release);
@@ -353,8 +564,8 @@ public:
             // Safely and idempotently clear the consecutive writer streak 
             // from the upper 32 bits without risking active reader logic.
             if ((s >> 32) > 0) [[unlikely]]
-            {
-                m_state.fetch_and(STATE_MASK,
+            {                
+                m_state.fetch_and(STATE_MASK, 
                                   std::memory_order_relaxed);
             }
 
@@ -382,12 +593,116 @@ public:
     // -------------------------------------------------------------------------
     bool TryReadLock() noexcept
     {
-        // Speculatively increment the read count to attempt lock-free acquisition.
+        if constexpr (EnableNUMA)
+        {
+            // Dynamically bypasses distributed logic when running strictly on a single node
+            // to maximize L1 cache locality and avoid hashing overhead.
+            if (NumaTopology<EnableNUMA>::is_multi_node) 
+            {
+                size_t idx = get_stripe_index();
+                
+                // memory_order_seq_cst enforces strict Store-Load ordering across ARM/PowerPC
+                m_numaState.stripes[idx].count.fetch_add(1, 
+                                                         std::memory_order_seq_cst);
+                
+                // Fetch the central state to check for writer barricades or starvation flags.                
+                uint64_t s = m_state.load(std::memory_order_seq_cst);
+
+                // Fast Path: Only successfully acquired if no writers are active/starving.
+                if ((s & (WRITE_LOCKED | WRITER_STARVING)) == 0) [[likely]]
+                {
+                    if ((s >> 32) > 0) [[unlikely]]
+                    {
+                        m_state.fetch_and(STATE_MASK, 
+                                          std::memory_order_relaxed);
+                    }
+                    
+                    return true;
+                }
+
+                // Contention detected. We must rollback the speculative local increment.
+                //
+                // Sequential consistency (SeqCst) is mandatory here. If Thread A and Thread B 
+                // rollback simultaneously on different stripes, the hardware memory fence 
+                // guarantees at least one thread observes get_total_readers() == 0 and triggers 
+                // the slow_read_unlock() baton pass, preventing queued writers from starving indefinitely.
+                uint32_t old_c = m_numaState.stripes[idx].count.fetch_sub(1, 
+                                                                          std::memory_order_seq_cst);
+                
+                if (old_c == 1 && get_total_readers() == 0)
+                {                    
+                    uint64_t current_s = m_state.load(std::memory_order_seq_cst);
+                    
+                    if ((current_s & HAS_WAITERS) && !(current_s & WRITE_LOCKED)) [[unlikely]]
+                    {                        
+                        slow_read_unlock(); 
+                    }
+                }
+
+                // Fast path failed; attempt to acquire the slow-path queue spinlock without blocking.
+                QueueLockGuard lk(m_queueLock, 
+                                  std::try_to_lock);
+                
+                if (!lk.owns_lock())
+                {
+                    return false;
+                }
+
+                check_and_trigger_override_unlocked();
+                s = m_state.load(std::memory_order_relaxed);
+                
+                // Attempt to acquire the read lock while holding the queue lock.
+                while (can_reader_acquire_unlocked(s))
+                {
+                    // Apply local stripe increment first
+                    m_numaState.stripes[idx].count.fetch_add(1, 
+                                                             std::memory_order_seq_cst);
+                    
+                    // Verify global state hasn't shifted to WRITE_LOCKED right as we incremented                    
+                    s = m_state.load(std::memory_order_seq_cst);
+                    
+                    if (can_reader_acquire_unlocked(s))
+                    {
+                        m_batchWriters.store(0, 
+                                             std::memory_order_relaxed);
+                                             
+                        // Clear the consecutive writer streak from the upper 32 bits to prevent
+                        // NUMA streak leakage.
+                        if ((s >> 32) > 0) [[unlikely]]
+                        {                
+                            m_state.fetch_and(STATE_MASK, 
+                                              std::memory_order_relaxed);
+                        }
+                                             
+                        return true;
+                    }
+                    
+                    // Global state shifted (e.g., a writer snuck in). Rollback and evaluate handoff.
+                    old_c = m_numaState.stripes[idx].count.fetch_sub(1, 
+                                                                     std::memory_order_seq_cst);
+                    
+                    if (old_c == 1 && get_total_readers() == 0)
+                    {
+                        if (m_headWriter.load(std::memory_order_relaxed) != nullptr)
+                        {
+                            notify_next_writer_unlocked();
+                        }
+                    }
+                    
+                    s = m_state.load(std::memory_order_relaxed);
+                }
+                
+                return false;
+            }
+        }
+
+        // Lock-Free Acquisition: Bypasses CAS loops for O(N) throughput.        
+        // Falls through here if EnableNUMA=false or multi_node=false.
         uint64_t s = m_state.fetch_add(READ_INC, 
                                        std::memory_order_acquire);
         
-        // Guard against reader count overflow.
-        if ((s & READ_MASK) == READ_MASK) [[unlikely]]
+        // Guard against bitmask overflow.
+        if ((s & OVERFLOW_GUARD) != 0) [[unlikely]]
         {
             // Rollback if maximum reader capacity is reached.
             m_state.fetch_sub(READ_INC, 
@@ -401,7 +716,7 @@ public:
         {
             // Clear the consecutive writer streak if present.
             if ((s >> 32) > 0) [[unlikely]]
-            {
+            {                
                 m_state.fetch_and(STATE_MASK, 
                                   std::memory_order_relaxed);
             }
@@ -415,7 +730,7 @@ public:
         
         // Critical Baton Pass: Wake waiting threads if we were the last reader.
         if ((old_s & READ_MASK) == 1 && (old_s & HAS_WAITERS) && !(old_s & WRITE_LOCKED)) [[unlikely]]
-        {
+        {            
             slow_read_unlock();
         }
 
@@ -463,6 +778,36 @@ public:
     // -------------------------------------------------------------------------
     void ReadUnlock() noexcept
     {
+        if constexpr (EnableNUMA)
+        {
+            if (NumaTopology<EnableNUMA>::is_multi_node) 
+            {
+                size_t idx = get_stripe_index();
+                
+                // Sequence consistency fence ensures zero-observation is safely published
+                uint32_t old_c = m_numaState.stripes[idx].count.fetch_sub(1, 
+                                                                          std::memory_order_seq_cst);
+                
+                assert(old_c > 0 && "ReadUnlock called without corresponding ReadLock");
+
+                if (old_c == 1)
+                {
+                    if (get_total_readers() == 0)
+                    {
+                        // Load with seq_cst to prevent ARM64 store-load reordering
+                        uint64_t s = m_state.load(std::memory_order_seq_cst);
+                        
+                        if ((s & HAS_WAITERS) && !(s & WRITE_LOCKED)) [[unlikely]]
+                        {
+                            slow_read_unlock();
+                        }
+                    }
+                }
+                
+                return;
+            }
+        }
+
         // 'release' optimally ensures all prior memory operations inside the critical section 
         // are globally visible to the next writer.
         uint64_t old_s = m_state.fetch_sub(READ_INC, 
@@ -485,7 +830,7 @@ public:
     // Blocks the thread until the lock is acquired or the optional timeout expires.
     // Returns true on success, false if the timeout was reached.
     // -------------------------------------------------------------------------
-    bool WriteLock(duration timeout = duration::max())
+    bool WriteLock(duration timeout = (duration::max)())
     {
         uint64_t s = m_state.load(std::memory_order_acquire);
 
@@ -495,23 +840,39 @@ public:
 
             if (Policy::maxConsecWriters == 0 || consec < static_cast<uint32_t>(Policy::maxConsecWriters)) [[likely]]
             {
-                // Fast Path: Only acquire if the lower 32-bits are absolute zero 
-                // (no readers, no writers, no waiters, no starving bits).
-                if ((s & STATE_MASK) == 0) [[likely]]
+                bool readers_clear = true;
+                
+                if constexpr (EnableNUMA) 
+                {
+                    // For NUMA, we must query the distributed stripe arrays to verify no active readers.
+                    if (NumaTopology<EnableNUMA>::is_multi_node) 
+                    {
+                        readers_clear = (get_total_readers() == 0);
+                    }
+                }
+                
+                // Fast Path: Ensures fast-path fails instantly if any readers, writers, or flags exist.
+                // NOTE: For NUMA, the lower 32-bits of `s` do not contain the reader count, so `readers_clear`
+                // acts as the authoritative gate.
+                if ((s & STATE_MASK) == 0 && readers_clear) [[likely]]
                 {
                     uint32_t next_consec = (consec < 0xFFFFFFFF) ? consec + 1 : consec;
                     uint64_t next_s = WRITE_LOCKED | (static_cast<uint64_t>(next_consec) << 32);
                     
                     // Optimized to compare_exchange_weak to avoid nested hardware spin-loops on ARM/PowerPC
+                    // Utilizing memory_order_seq_cst establishes absolute store-load ordering against remote stripes
                     if (m_state.compare_exchange_weak(s, 
                                                       next_s, 
-                                                      std::memory_order_acquire, 
+                                                      std::memory_order_seq_cst, 
                                                       std::memory_order_relaxed)) [[likely]]
-                    {
+                    {                        
+                        // By executing the CAS above, this thread globally sets the  WRITE_LOCKED bit. 
+                        // This barricade physically prevents any new readers from acquiring their 
+                        // local stripes. We then spin-wait efficiently until any residual readers finish draining.
+                        drain_numa_readers();
                         return true;
                     }
 
-                    // Loop re-evaluates automatically with the newly updated `s` from the failed CAS
                     continue;
                 }
             }
@@ -524,70 +885,160 @@ public:
 
     // -------------------------------------------------------------------------
     // Attempts to acquire exclusive write access without blocking.
-    // Returns true immediately if successful, false if any readers or writers are active.
+    // Returns true immediately if successful, false if any readers or writers 
+    // are active.
     // -------------------------------------------------------------------------
     bool TryWriteLock() noexcept
     {
-        // Load the current state to evaluate limits and fast-path acquisition.
         uint64_t s = m_state.load(std::memory_order_acquire);
         uint32_t consec = static_cast<uint32_t>(s >> 32);
 
-        // Ensure we are not breaching the consecutive writer limit.
         if (Policy::maxConsecWriters == 0 || consec < static_cast<uint32_t>(Policy::maxConsecWriters)) [[likely]]
         {
-            // Fast Path: Only acquire if the lower 32-bits are absolute zero.
-            if ((s & STATE_MASK) == 0) [[likely]]
+            bool readers_clear = true;
+            
+            if constexpr (EnableNUMA) 
+            {
+                if (NumaTopology<EnableNUMA>::is_multi_node) 
+                {
+                    readers_clear = (get_total_readers() == 0);
+                }
+            }
+            
+            // Evaluate global flags and aggregate NUMA reader clearance simultaneously.
+            if ((s & STATE_MASK) == 0 && readers_clear) [[likely]]
             {
                 uint32_t next_consec = (consec < 0xFFFFFFFF) ? consec + 1 : consec;
                 uint64_t next_s = WRITE_LOCKED | (static_cast<uint64_t>(next_consec) << 32);
                 
-                // Strong CAS is correct here because TryWriteLock does not loop on the fast path.
                 if (m_state.compare_exchange_strong(s, 
                                                     next_s, 
-                                                    std::memory_order_acquire, 
+                                                    std::memory_order_seq_cst, 
                                                     std::memory_order_relaxed)) [[likely]]
                 {
+                    if constexpr (EnableNUMA)
+                    {
+                        // A reader thread could have executed its fetch_add() on a remote NUMA node 
+                        // strictly in the nanoseconds between our `readers_clear` evaluation and the CAS 
+                        // execution.
+                        if (NumaTopology<EnableNUMA>::is_multi_node && get_total_readers() > 0)
+                        {
+                            // A reader snuck in. We implement a highly bounded spin to avoid phantom aborts
+                            // while rigidly maintaining the non-blocking TryLock specification.
+                            bool readers_cleared = false;
+                            
+                            for (int i = 0; i < 32; ++i)
+                            {
+                                if (get_total_readers() == 0)
+                                {
+                                    readers_cleared = true;
+                                    break;
+                                }
+                                
+                                cpu_relax_pause();
+                            }
+                            
+                            if (!readers_cleared)
+                            {
+                                // Revert the speculative writer streak increment before aborting
+                                // to prevent permanently polluting the fairness tracker.
+                                if (next_consec > consec)
+                                {
+                                    m_state.fetch_sub(1ULL << 32, 
+                                                      std::memory_order_relaxed);
+                                }
+
+                                WriteUnlock();
+                                return false;
+                            }
+                        }
+                    }
+                    
+                    drain_numa_readers();
                     return true;
                 }
             }
         }
 
-        // Fast path failed; attempt to acquire the slow-path queue lock without blocking.
         QueueLockGuard lk(m_queueLock, 
                           std::try_to_lock);
         
-        // Return immediately if the queue lock is contended.
         if (!lk.owns_lock())
         {
             return false;
         }
 
-        // Evaluate if Override Mode needs to be activated.
         check_and_trigger_override_unlocked();
         s = m_state.load(std::memory_order_relaxed);
         
-        // Loop to attempt acquisition if the lock state permits writers.
         while (can_writer_acquire_unlocked(s, false))
         {
             consec = static_cast<uint32_t>(s >> 32);
             uint32_t next_consec = (consec < 0xFFFFFFFF) ? consec + 1 : consec;
+            
             uint64_t next_s = (s | WRITE_LOCKED) & STATE_MASK;
+            
+            // Barging writers must forcibly unblock fast-path readers since they bypass queues
+            next_s &= ~WRITER_STARVING; 
+            
             next_s |= (static_cast<uint64_t>(next_consec) << 32);
 
-            // Use weak CAS since we are looping.
             if (m_state.compare_exchange_weak(s, 
                                               next_s, 
-                                              std::memory_order_acquire, 
+                                              std::memory_order_seq_cst, 
                                               std::memory_order_relaxed))
             {
-                // Track batch limits since we successfully acquired as a writer.
                 update_writer_batch_unlocked();
+                
+                // Drop the queue lock first to minimize OS-level critical section time.
+                lk.unlock();
+                
+                if constexpr (EnableNUMA)
+                {
+                    // Exact same TOCTOU rollback applies when acquiring via the slow-path loop.
+                    if (NumaTopology<EnableNUMA>::is_multi_node && get_total_readers() > 0)
+                    {
+                        bool readers_cleared = false;
+                        
+                        for (int i = 0; i < 32; ++i)
+                        {
+                            if (get_total_readers() == 0)
+                            {
+                                readers_cleared = true;
+                                break;
+                            }
+                            
+                            cpu_relax_pause();
+                        }
+                        
+                        if (!readers_cleared)
+                        {
+                            // Revert the speculative writer streak increment safely before aborting
+                            if (next_consec > consec)
+                            {
+                                m_state.fetch_sub(1ULL << 32, 
+                                                  std::memory_order_relaxed);
+                            }
+                            
+                            // Revert the batch writer increment if override was active
+                            if (m_writerOverride.load(std::memory_order_relaxed))
+                            {
+                                m_batchWriters.fetch_sub(1, 
+                                                         std::memory_order_relaxed);
+                            }
+
+                            WriteUnlock();
+                            return false;
+                        }
+                    }
+                }
+                
+                drain_numa_readers();
 
                 return true;
             }
         }
         
-        // The lock cannot be acquired immediately.
         return false;
     }
 
@@ -663,7 +1114,8 @@ private:
     // Lower 32 Bits: Active reader count and state flags.
     // -------------------------------------------------------------------------
     static constexpr uint64_t READ_INC        = 0x0000000000000001ULL;
-    static constexpr uint64_t READ_MASK       = 0x000000000FFFFFFFULL; 
+    static constexpr uint64_t READ_MASK       = 0x0000000007FFFFFFULL; // Support up to ~134 Million Concurrent Readers
+    static constexpr uint64_t OVERFLOW_GUARD  = 0x0000000008000000ULL; 
     static constexpr uint64_t WRITER_STARVING = 0x0000000010000000ULL; 
     static constexpr uint64_t WRITE_LOCKED    = 0x0000000040000000ULL; 
     static constexpr uint64_t HAS_WAITERS     = 0x0000000080000000ULL;
@@ -675,7 +1127,7 @@ private:
     {
         WriterNode*           prev = nullptr;
         WriterNode*           next = nullptr;
-        std::binary_semaphore sem{0};
+        std::binary_semaphore sem{ 0 };
         time_point            ts;
     };
 
@@ -770,65 +1222,200 @@ private:
         }
     };
 
+    // Identifies a distributed memory stripe using an immutable thread-local hash.
+    //
+    // ARCHITECTURAL NOTE: 
+    // While OS APIs like sched_getcpu() or GetCurrentProcessorNumber() provide exact 
+    // physical topologies, they introduce vDSO/API overhead (~10-20 cycles) that 
+    // severely degrades lock-free fast-path throughput. 
+    // 
+    // This TLS hash executes in ~2 ALU cycles. If the OS migrates the thread to a 
+    // different NUMA node, the thread may write to a remote stripe. However, since 
+    // the access remains strictly UNCONTENDED, it completely avoids cache-line bouncing 
+    // and remains substantially faster than synchronizing on a central state.
+    inline size_t get_stripe_index() const noexcept
+    {
+        if constexpr (EnableNUMA)
+        {
+            if (!NumaTopology<EnableNUMA>::is_multi_node)
+            {
+                return 0;
+            }
+
+            // Constant-initialized TLS guarantees zero runtime allocation cost
+            thread_local const int tls_dummy = 0;
+            uint64_t x = static_cast<uint64_t>(reinterpret_cast<std::uintptr_t>(&tls_dummy));
+
+            // SplitMix64 avalanche algorithm diffuses the pointer address bits.
+            // This ensures threads allocated in similar memory regions do not collide.
+            x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ULL;
+            x = (x ^ (x >> 27)) * 0x94d049bb133111ebULL;
+            x = x ^ (x >> 31);
+
+            // Exploits zero-cost bitwise modulo since num_stripes is a power of 2
+            return x & (NumaTopology<EnableNUMA>::num_stripes - 1);
+        }
+        else
+        {
+            return 0;
+        }
+    }
+
+    // Unifies the total reader count logic across both architectures
+    uint32_t get_total_readers() const noexcept
+    {
+        if constexpr (EnableNUMA)
+        {
+            if (NumaTopology<EnableNUMA>::is_multi_node)
+            {
+                uint32_t total = 0;
+                
+                for (size_t i = 0; i < NumaTopology<EnableNUMA>::num_stripes; ++i) 
+                {
+                    total += m_numaState.stripes[i].count.load(std::memory_order_seq_cst);
+                }
+                
+                return total;
+            }
+        }
+        
+        return static_cast<uint32_t>(m_state.load(std::memory_order_relaxed) & READ_MASK);
+    }
+
+    // Drains active distributed readers waiting for their stripe counters to reach zero
+    // Actively relies on Ticket-Lock semantics established by setting WRITE_LOCKED prior to call
+    inline void drain_numa_readers() const noexcept
+    {
+        if constexpr (EnableNUMA)
+        {
+            if (NumaTopology<EnableNUMA>::is_multi_node)
+            {
+                for (size_t i = 0; i < NumaTopology<EnableNUMA>::num_stripes; ++i)
+                {
+                    while (m_numaState.stripes[i].count.load(std::memory_order_seq_cst) > 0)
+                    {
+                        cpu_relax_pause();
+                    }
+                }
+            }
+        }
+    }
+
     // Handles locking when the fast-path fails for readers.
     // Registers the reader in the wait counter and waits on the reader condition variable.
     bool slow_read_lock(duration timeout)
     {
         LOG_DEBUG(this, "Reader entered slow path");
 
-        // Register this reader in the slow-path wait queue.
+        // Increment the slow-path reader counter. This tracks how many readers 
+        // are currently spinning or sleeping, which is used for baton-passing.
         m_readersWaiting.fetch_add(1,
                                    std::memory_order_acquire);
                                    
-        // Ensure the fast-path knows there are threads waiting.
+        // Set the HAS_WAITERS bit so current fast-path owners know to invoke 
+        // the slow-path unlock routines when they finish.
         m_state.fetch_or(HAS_WAITERS,
                          std::memory_order_relaxed);
 
         // Acquire the queue spinlock.
         QueueLockGuard lk(m_queueLock);
         
-        // Evaluate if Override Mode needs to be activated before we wait.
+        // Check if any queued writers have exceeded their wait thresholds.
         check_and_trigger_override_unlocked();
 
-        time_point deadline = (timeout == duration::max()) ? time_point::max() : clock::now() + timeout;
+        time_point deadline = (timeout == (duration::max)()) ? (time_point::max)() : clock::now() + timeout;
         bool acquired = false;
 
         while (true)
         {
             uint64_t s = m_state.load(std::memory_order_relaxed);
             
-            // Attempt to acquire the lock directly if the state permits.
+            // Check if current lock policies allow a reader to proceed.
+            // This returns false if a writer is active or starving.
             if (can_reader_acquire_unlocked(s))
             {
-                uint64_t next_s = (s + READ_INC) & STATE_MASK;
+                bool attempt_centralized = true;
 
-                if (m_state.compare_exchange_weak(s,
-                                                  next_s,
-                                                  std::memory_order_acquire,
-                                                  std::memory_order_relaxed))
+                if constexpr (EnableNUMA)
                 {
-                    // Reset the writer batch count since a reader successfully acquired.
-                    m_batchWriters.store(0,
-                                         std::memory_order_relaxed);
-                    acquired = true;
-
-                    break;
+                    if (NumaTopology<EnableNUMA>::is_multi_node) 
+                    {
+                        attempt_centralized = false;
+                        size_t idx          = get_stripe_index();
+                        
+                        // Register the read on the thread's local NUMA stripe.
+                        m_numaState.stripes[idx].count.fetch_add(1, 
+                                                                 std::memory_order_seq_cst);
+                        
+                        s = m_state.load(std::memory_order_seq_cst);
+                        
+                        // Verify that the global state is still valid after our local increment.
+                        if (can_reader_acquire_unlocked(s))
+                        {
+                            m_batchWriters.store(0, 
+                                                 std::memory_order_relaxed);
+                            acquired = true;
+                            
+                            // Clear the consecutive writer streak from the upper 32 bits to
+                            // prevent NUMA streak leakage.
+                            if ((s >> 32) > 0) [[unlikely]]
+                            {                
+                                m_state.fetch_and(STATE_MASK, 
+                                                  std::memory_order_relaxed);
+                            }
+                            
+                            break;
+                        }
+                        
+                        // Global state changed (e.g. a writer set WRITE_LOCKED). 
+                        // Rollback the local counter using sequential consistency to ensure 
+                        // that writers observing `get_total_readers()` see synchronized values.
+                        uint32_t old_c = m_numaState.stripes[idx].count.fetch_sub(1, 
+                                                                                  std::memory_order_seq_cst);
+                        
+                        // If this rollback cleared the final active reader, notify the waiting writer.
+                        if (old_c == 1 && get_total_readers() == 0)
+                        {
+                            if (m_headWriter.load(std::memory_order_relaxed) != nullptr)
+                            {
+                                notify_next_writer_unlocked();
+                            }
+                        }
+                    }
                 }
 
-                // Retry CAS on weak failure.
-                continue;
+                // Standard UMA logic: Attempt a global compare-and-swap to add a reader.
+                if (attempt_centralized)
+                {
+                    uint64_t next_s = (s + READ_INC) & STATE_MASK;
+
+                    if (m_state.compare_exchange_weak(s,
+                                                      next_s,
+                                                      std::memory_order_acquire,
+                                                      std::memory_order_relaxed))
+                    {
+                        // Reset the writer batch count since a reader successfully acquired.
+                        m_batchWriters.store(0,
+                                             std::memory_order_relaxed);
+                        acquired = true;
+
+                        break;
+                    }
+                    
+                    continue; // Loop naturally re-evaluates if the CAS fails.
+                }
             }
 
-            // Re-evaluate override policies before going to sleep.
+            // Lock is unavailable. Update writer wait times before sleeping.
             check_and_trigger_override_unlocked();
             
-            // Release the spinlock to allow other threads to operate while we sleep.
+            // Release the queue spinlock so other threads can proceed.
             lk.unlock();
             
             bool acquired_sem = false;
             
-            // Sleep on the semaphore until woken or the timeout expires.
-            if (deadline == time_point::max())
+            // Block the thread until notified by an unlocking writer or timeout.
+            if (deadline == (time_point::max)())
             {
                 m_semReaders.acquire();
                 acquired_sem = true;
@@ -838,48 +1425,94 @@ private:
                 acquired_sem = m_semReaders.try_acquire_until(deadline);
             }
             
-            // Reacquire the spinlock after waking up.
+            // Re-acquire the queue spinlock upon waking.
             lk.lock();
             
-            // If we timed out, attempt one last optimistic acquisition loop.
+            // If the timeout expired, make a final attempt to acquire the lock.
+            // This handles cases where the lock became available exactly at the deadline.
             if (!acquired_sem)
             {
                 s = m_state.load(std::memory_order_relaxed);
                 
-                // Mitigates spurious CAS failures directly following a timeout wake event. 
-                // We utilize a weak exchange loop here to verify whether the lock is 
-                // logically acquirable despite the timeout expiration.
                 while (can_reader_acquire_unlocked(s))
                 {
-                    uint64_t next_s = (s + READ_INC) & STATE_MASK;
+                    bool attempt_centralized = true;
 
-                    if (m_state.compare_exchange_weak(s,
-                                                      next_s,
-                                                      std::memory_order_acquire,
-                                                      std::memory_order_relaxed))
+                    if constexpr (EnableNUMA)
                     {
-                        // Reset the writer batch count on successful acquire.
-                        m_batchWriters.store(0,
-                                             std::memory_order_relaxed);
-                        acquired = true;
-                        
-                        break;
+                        if (NumaTopology<EnableNUMA>::is_multi_node) 
+                        {
+                            attempt_centralized = false;
+                            size_t idx          = get_stripe_index();
+                            
+                            m_numaState.stripes[idx].count.fetch_add(1, 
+                                                                     std::memory_order_seq_cst);
+                            
+                            s = m_state.load(std::memory_order_seq_cst);
+                            
+                            if (can_reader_acquire_unlocked(s))
+                            {
+                                m_batchWriters.store(0, 
+                                                     std::memory_order_relaxed);
+                                acquired = true;
+                                
+                                // Clear the consecutive writer streak from the upper 32 bits to 
+                                // prevent NUMA streak leakage.
+                                if ((s >> 32) > 0) [[unlikely]]
+                                {                
+                                    m_state.fetch_and(STATE_MASK, 
+                                                      std::memory_order_relaxed);
+                                }
+                                
+                                break;
+                            }
+                            
+                            uint32_t old_c = m_numaState.stripes[idx].count.fetch_sub(1, 
+                                                                                      std::memory_order_seq_cst);
+                            
+                            if (old_c == 1 && get_total_readers() == 0)
+                            {
+                                if (m_headWriter.load(std::memory_order_relaxed) != nullptr)
+                                {
+                                    notify_next_writer_unlocked();
+                                }
+                            }
+                                                                     
+                            s = m_state.load(std::memory_order_relaxed);
+                        }
+                    }
+
+                    if (attempt_centralized)
+                    {
+                        uint64_t next_s = (s + READ_INC) & STATE_MASK;
+
+                        if (m_state.compare_exchange_weak(s,
+                                                          next_s,
+                                                          std::memory_order_acquire,
+                                                          std::memory_order_relaxed))
+                        {
+                            m_batchWriters.store(0, 
+                                                 std::memory_order_relaxed);
+                            acquired = true;
+                            
+                            break;
+                        }
                     }
                 }
 
-                // Exit the main loop if we didn't acquire it after timeout.
+                // Exit the main loop if we didn't acquire it after the timeout.
                 break;
             }
         }
 
-        // Unregister this reader from the slow-path wait queue.
+        // Cleanup: Thread is exiting the slow path. Decrement the waiting counter.
         m_readersWaiting.fetch_sub(1,
                                    std::memory_order_release);
                                    
-        // Synchronize the fast-path HAS_WAITERS bit.
+        // Update the global flag to reflect if any threads are still waiting.
         update_has_waiters_unlocked();
 
-        // If we gave up, but there are no more waiting readers, we need to pass the baton back to writers.
+        // If the thread timed out, and no other readers are waiting, wake up the next writer.
         if (!acquired && m_readersWaiting.load(std::memory_order_relaxed) == 0 && m_headWriter.load() != nullptr)
         {
             notify_next_writer_unlocked();
@@ -894,13 +1527,13 @@ private:
     }
 
     // Handles the baton-passing logic when the last active reader leaves.
-    // Evaluates policies to decide whether to wake a writer or a batch of queued readers.
+    // Evaluates policies to decide whether to wake a writer or a batch of queued readers.    
     void slow_read_unlock() noexcept
     {
         // Acquire the queue spinlock for safe queue manipulation.
         QueueLockGuard lk(m_queueLock);
         
-        uint64_t s = m_state.load(std::memory_order_relaxed);
+        uint64_t s      = m_state.load(std::memory_order_relaxed);
         uint32_t consec = static_cast<uint32_t>(s >> 32);
 
         // Check if there are writers waiting in the queue.
@@ -942,21 +1575,30 @@ private:
     {
         LOG_DEBUG(this, "Writer entered slow path");
 
+        // Broadcast to fast-path users that threads are waiting in the queue, 
+        // ensuring they trigger the slow-path wake mechanisms upon unlocking.
         m_state.fetch_or(HAS_WAITERS, 
                          std::memory_order_relaxed);
         
+        // Acquire the atomic spinlock to safely modify the writer linked list.
         QueueLockGuard lk(m_queueLock);
         
+        // Evaluate if the lead writer has been waiting too long.
         check_and_trigger_override_unlocked();
 
+        // Allocate the queue node on the thread's local stack to avoid heap 
+        // allocation overhead during contention.
         WriterNode myNode;
         myNode.ts = clock::now();
         link_writer_unlocked(&myNode);
         update_has_waiters_unlocked();
 
+        // RAII guard ensures the node is safely unlinked if an exception occurs 
+        // or the function returns early due to a timeout.
         ScopeUnlinker unlinker(this, &myNode);
-        time_point deadline = (timeout == duration::max()) ? time_point::max() : clock::now() + timeout;
+        time_point deadline = (timeout == (duration::max)()) ? (time_point::max)() : clock::now() + timeout;
 
+        // Establish the exact time this specific writer should trigger starvation mode.
         time_point starve_time = myNode.ts + Policy::starvationThreshold; 
         bool asserted_starvation = false;
 
@@ -977,6 +1619,7 @@ private:
                 if (writer_limits_reached_unlocked(consec) && 
                     yield_count < Policy::maxYieldsBeforeBypass && timeout > duration::zero())
                 {
+                    // Release the queue lock so other queue operations can proceed while we back off.
                     lk.unlock();
 
                     // 1. Hardware Spin Phase: Wait out transient fast-path operations
@@ -993,23 +1636,27 @@ private:
 
                     lk.lock();
 
+                    // Re-evaluate override policies after the yield
                     check_and_trigger_override_unlocked();
                     yield_count++;
 
                     continue;
                 }
 
+                // If we've yielded enough times, bypass the fairness limits to prevent a deadlock.
                 bool bypass_limits = (yield_count >= Policy::maxYieldsBeforeBypass);
 
+                // Check if the writer is logically permitted to acquire the lock (verifies no active readers).
                 if (can_writer_acquire_unlocked(s, bypass_limits))
                 {
                     uint32_t next_consec = (consec < 0xFFFFFFFF) ? consec + 1 : consec;
                     uint64_t next_s = (s | WRITE_LOCKED) & STATE_MASK;
                     next_s |= (static_cast<uint64_t>(next_consec) << 32);
 
+                    // Attempt to globally set the WRITE_LOCKED flag.
                     if (m_state.compare_exchange_weak(s, 
                                                       next_s, 
-                                                      std::memory_order_acquire, 
+                                                      std::memory_order_seq_cst, 
                                                       std::memory_order_relaxed))
                     {
                         acquired = true;
@@ -1021,6 +1668,7 @@ private:
                 }
             }
 
+            // Determine whether the thread should sleep until the timeout or the starvation threshold.
             time_point wait_until_time = deadline;
             
             if (is_head && !asserted_starvation && wait_until_time > starve_time)
@@ -1032,7 +1680,8 @@ private:
             
             bool acquired_sem = false;
             
-            if (wait_until_time == time_point::max())
+            // Sleep on the local stack semaphore until notified by an unlocking thread.
+            if (wait_until_time == (time_point::max)())
             {
                 myNode.sem.acquire();
                 acquired_sem = true;
@@ -1046,6 +1695,7 @@ private:
             
             yield_count = 0; 
             
+            // If the thread woke up because the starvation threshold was reached, assert the flag.
             if (is_head && !asserted_starvation && clock::now() >= starve_time)
             {
                 // Trip the starvation bit to block new fast-path readers.
@@ -1057,6 +1707,7 @@ private:
                 LOG_DEBUG(this, "Writer starvation asserted");
             }
 
+            // If the absolute timeout was reached, make one final acquisition attempt.
             if (!acquired_sem && clock::now() >= deadline)
             {
                 is_head = (m_headWriter.load() == &myNode);
@@ -1073,9 +1724,10 @@ private:
                         uint64_t next_s = (s | WRITE_LOCKED) & STATE_MASK;
                         next_s |= (static_cast<uint64_t>(next_consec) << 32);
 
+                        // Use a strong CAS for the final attempt to avoid spurious failures.
                         if (m_state.compare_exchange_strong(s, 
                                                             next_s, 
-                                                            std::memory_order_acquire, 
+                                                            std::memory_order_seq_cst, 
                                                             std::memory_order_relaxed))
                         {
                             acquired = true;
@@ -1098,6 +1750,15 @@ private:
         update_has_waiters_unlocked();
         
         update_writer_batch_unlocked();
+        
+        // Exit the queue critical section before draining remote NUMA reader nodes.
+        // Holding the queue lock while spinning on remote stripes would stall the entire 
+        // slow-path queue system across all CPU sockets.
+        lk.unlock();
+        
+        // Spin-wait until all distributed NUMA readers have exited their respective stripes.
+        // The earlier CAS setting WRITE_LOCKED acts as the barricade to prevent new ones.
+        drain_numa_readers();
 
         return true;
     }
@@ -1119,10 +1780,13 @@ private:
 
         uint64_t clear_mask = WRITE_LOCKED;
         
-        // If handing off to readers or limits were breached, drop the starving bit.
         if (handoff_to_readers || limits_reached)
         {
             clear_mask |= WRITER_STARVING;
+            
+            // Ensures the consecutive tracker is zeroed properly when 
+            // the writer streak caps out, returning throughput to baseline.
+            clear_mask |= (0xFFFFFFFFULL << 32);
         }
 
         // Safely clear the write lock and any optional starving flags.
@@ -1256,12 +1920,14 @@ private:
     // Determines if any fairness policies (batch limit, timeslice, consecutive limits) have been breached.
     bool writer_limits_reached_unlocked(uint32_t current_consec) const noexcept
     {
+        // 1. Check if the active override batch has hit the maximum allowed consecutive writers.
         if (Policy::writerBatchLimit > 0 && 
             m_batchWriters.load(std::memory_order_relaxed) >= Policy::writerBatchLimit)
         {
             return true;
         }
 
+        // 2. Check if the global override timeslice window has expired.
         if (m_writerOverride.load(std::memory_order_relaxed) && 
             Policy::overrideTimeslice > duration::zero())
         {
@@ -1273,6 +1939,7 @@ private:
             }
         }
 
+        // 3. Check if the standard (non-override) consecutive writer streak has been capped.
         if (Policy::maxConsecWriters > 0 && 
             current_consec >= static_cast<uint32_t>(Policy::maxConsecWriters))
         {
@@ -1285,6 +1952,7 @@ private:
     // Determines if it is safe for a reader in the slow-path to acquire the lock.
     bool can_reader_acquire_unlocked(uint64_t s) const noexcept
     {
+        // Readers can never acquire if a writer currently owns the exclusive lock.
         if (s & WRITE_LOCKED)
         {
             return false;
@@ -1292,6 +1960,8 @@ private:
         
         uint32_t consec = static_cast<uint32_t>(s >> 32);
 
+        // If a writer is actively starving, readers must wait in the queue unless the 
+        // writer has exceeded its allocated fairness limits (forcing a baton handoff).
         if (s & WRITER_STARVING) 
         {
             if (!writer_limits_reached_unlocked(consec))
@@ -1300,21 +1970,53 @@ private:
             }
         }
 
+        // Readers can successfully proceed if we are NOT in an override, 
+        // OR if the override is active but has capped out on its limits.
         return !m_writerOverride.load(std::memory_order_relaxed) || writer_limits_reached_unlocked(consec);
     }
 
     // Determines if it is safe for a writer in the slow-path to acquire the lock.
     bool can_writer_acquire_unlocked(uint64_t s, bool ignore_limits) const noexcept
     {
-        if (s & (WRITE_LOCKED | READ_MASK))
+        // Another writer already holds the exclusive lock.
+        if ((s & WRITE_LOCKED) != 0)
+        {
+            return false;
+        }
+        
+        bool has_readers = false;
+        
+        // Safely check for active readers, accommodating distributed NUMA stripes if enabled.
+        if constexpr (EnableNUMA) 
+        {
+            if (NumaTopology<EnableNUMA>::is_multi_node) 
+            {
+                has_readers = (get_total_readers() > 0);
+            } 
+            else 
+            {
+                has_readers = ((s & READ_MASK) != 0);
+            }
+        } 
+        else 
+        {
+            has_readers = ((s & READ_MASK) != 0);
+        }
+        
+        // Writers cannot acquire if ANY readers (fast-path or slow-path) are currently active.
+        if (has_readers)
         {
             return false;
         }
 
         uint32_t consec = static_cast<uint32_t>(s >> 32);
 
+        // If the writer has hit its fairness limits, it must yield the lock to waiting readers.
         if (writer_limits_reached_unlocked(consec))
         {
+            // Edge case: If limits are reached but absolutely no readers are waiting, 
+            // the writer is explicitly permitted to bypass the limit to prevent unnecessary 
+            // stalling and potential deadlocks.
             if (ignore_limits && m_readersWaiting.load(std::memory_order_relaxed) == 0)
             {
                 return true;
@@ -1341,7 +2043,8 @@ private:
     {
         if (!m_writerOverride.load(std::memory_order_relaxed) && m_headWriter.load() != nullptr)
         {
-            auto wait_start = std::max(m_headWriter.load()->ts, m_lastOverrideEnd);
+            // std::max wrapped in parenthesis to bypass colliding with <windows.h> max macro
+            auto wait_start = (std::max)(m_headWriter.load()->ts, m_lastOverrideEnd);
 
             if (clock::now() - wait_start >= Policy::maxWriterWait)
             {
@@ -1408,46 +2111,65 @@ private:
     }
 
     // -------------------------------------------------------------------------
-    // Class Variables (Optimized memory packing layout)
+    // Class Variables (2-Cache-Line Segregation)
+    // 
+    // In-Object Footprint (x86_64 / standard ARM64): 
+    // - Non-NUMA (EnableNUMA = false): 128 Bytes (exactly 2 cache lines)
+    // - NUMA-Aware (EnableNUMA = true):  128 Bytes (2 cache lines) + heap array
+    // 
+    // In-Object Footprint (Apple Silicon):
+    // - Non-NUMA / NUMA: 256 Bytes (exactly two 128-byte cache lines)
+    // 
+    // Line 1: Fast-Path Domain. Uncontended readers/writers only touch this line.
+    // Line 2: Slow-Path Domain. Isolated to prevent TTAS spinlock false-sharing 
+    //         from invalidating the fast-path state across CPU cores.
     // -------------------------------------------------------------------------
 
-    // Fast Path (8 bytes)
-    // Upper 32 bits: Consecutive writers streak.
-    // Lower 32 bits: Active reader count and state flags (e.g., WRITE_LOCKED)  
-    alignas(CACHE_LINE_SIZE) std::atomic<uint64_t> m_state{0};
-        
-    // Slow Path State Pack
-    // Explicitly grouped to minimize internal struct padding.
+    // --- CACHE LINE 1 (Offset 0x00) ---
+    // Forces the object itself to start on a cache line to prevent external false sharing.
+    alignas(CACHE_LINE_SIZE) std::atomic<uint64_t> m_state{ 0 };
     
-    // 4-byte types (Grouped side-by-side to equal exactly 8 bytes)
-    // The number of readers currently registered in the slow-path wait queue
-    alignas(CACHE_LINE_SIZE) std::atomic<int> m_readersWaiting{0}; 
-    // The number of consecutive writers that have acquired the lock during the current override phase.
-    std::atomic<int>                          m_batchWriters{0};   
+    // Non-NUMA: 0 bytes (empty struct optimization).
+    // NUMA: 8 bytes (std::unique_ptr to distributed stripe array).    
+    [[no_unique_address]] NumaStorage<EnableNUMA>  m_numaState;
+
+    // --- CACHE LINE 2 (Offset 0x40 on x86_64, 0x80 on Apple Silicon) ---
+    // The alignas directive pads out the remainder of Line 1 and pushes the slow-path 
+    // queue state exactly to the start of the next hardware cache line.
+    //
+    // MEMORY FOOTPRINT VS. PERFORMANCE TRADE-OFF:
+    // If object footprint size is a crucial factor (e.g., allocating millions of locks 
+    // for highly fine-grained data structures), the `alignas(CACHE_LINE_SIZE)` on 
+    // `m_headWriter` below can be removed.
+    //
+    // Footprint Reduction: Removing it packs the entire lock into a single cache line 
+    // (64 bytes on x86_64, 128 bytes on Apple Silicon).
+    // 
+    // Estimated Performance Cost: 
+    // - Uncontended workloads: 0% degradation (remains a single L1 cache hit).
+    // - Contended workloads: about 50% degradation in fast-path throughput. Threads 
+    //   spinning on `m_queueLock` will trigger false-sharing invalidations on 
+    //   `m_state`, causing cache-line bouncing across the CPU interconnect and 
+    //   introducing tail latency spikes.
     
-    // 8-byte types
-    // Pointer to the front of the intrusive linked list of waiting writers
-    std::atomic<WriterNode*>                  m_headWriter{nullptr}; 
-    // Pointer to the back of the intrusive linked list of waiting writers.
-    // Safe to be non-atomic as it is only accessed/modified under m_queueLock.
-    WriterNode*                               m_tailWriter = nullptr;
-    // The raw integer representation (ticks) of the deadline for the current Override Mode.
-    std::atomic<clock::duration::rep>         m_overrideEndRep{0};   
-    // The timestamp of when the previous Override Mode ended.
-    time_point                                m_lastOverrideEnd{};   
-    // Counting semaphore for waking pooled readers safely without dynamic allocation.
-    std::counting_semaphore<PTRDIFF_MAX>      m_semReaders{0};
-    
-    // 1-byte types
-    // Flag indicating the lock is in Emergency Override Mode.
-    std::atomic<bool>                         m_writerOverride{false}; 
-    // Atomic Spinlock to protect queue manipulation.
-    mutable std::atomic_flag                  m_queueLock = ATOMIC_FLAG_INIT;
+    // 8-Byte Aligned Members
+    alignas(CACHE_LINE_SIZE) std::atomic<WriterNode*> m_headWriter{ nullptr }; 
+    WriterNode*                                       m_tailWriter = nullptr;
+    std::atomic<clock::duration::rep>                 m_overrideEndRep{ 0 };   
+    time_point                                        m_lastOverrideEnd{};   
+    std::counting_semaphore<PTRDIFF_MAX>              m_semReaders{ 0 };
+
+    // 4-Byte Aligned Members
+    std::atomic<int>                                  m_readersWaiting{ 0 }; 
+    std::atomic<int>                                  m_batchWriters{ 0 };   
+
+    // 1-Byte Aligned Members
+    mutable std::atomic_flag                          m_queueLock = ATOMIC_FLAG_INIT;
+    std::atomic<bool>                                 m_writerOverride{ false }; 
 
 #ifndef NDEBUG
-    // Optional callback function for emitting diagnostic lock transition logs
-    LoggerFn                                  m_logger;
-    // Flag indicating if the diagnostic logger has been attached.
-    std::atomic<bool>                         m_loggerAttached{ false };
+    // Diagnostic state (Usually pushes size to a 3rd cache line in Debug builds)
+    LoggerFn                                          m_logger;
+    std::atomic<bool>                                 m_loggerAttached{ false };
 #endif
 };

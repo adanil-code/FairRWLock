@@ -120,7 +120,7 @@ public:
     {
     public:
         // Attempts to acquire a read lock, optionally bound by a timeout.
-        explicit ReadGuard(TextbookReaderPrefLock& l, duration timeout = duration::max()) : m_lock(&l)
+        explicit ReadGuard(TextbookReaderPrefLock& l, duration timeout = (duration::max)()) : m_lock(&l)
         {
             m_locked = m_lock->ReadLock(timeout);
         }
@@ -181,7 +181,7 @@ public:
     {
     public:
         // Attempts to acquire an exclusive write lock, optionally bound by a timeout.
-        explicit WriteGuard(TextbookReaderPrefLock& l, duration timeout = duration::max()) : m_lock(&l)
+        explicit WriteGuard(TextbookReaderPrefLock& l, duration timeout = (duration::max)()) : m_lock(&l)
         {
             m_locked = m_lock->WriteLock(timeout);
         }
@@ -247,7 +247,7 @@ public:
     // expires.
     // Returns true on success, false if the timeout was reached.
     // -------------------------------------------------------------------------
-    bool ReadLock(duration timeout = duration::max())
+    bool ReadLock(duration timeout = (duration::max)())
     {
         // Acquire the mutex to inspect and safely modify the lock state.
         std::unique_lock lk(m_mtx);
@@ -265,7 +265,7 @@ public:
         bool acquired = false;
         
         // Sleep on the condition variable until the predicate is satisfied or timeout expires.
-        if (timeout == duration::max())
+        if (timeout == (duration::max)())
         {
             m_cvReaders.wait(lk, predicate);
             acquired = true;
@@ -343,7 +343,7 @@ public:
     // Blocks the thread until the lock is acquired or the optional timeout expires.
     // Returns true on success, false if the timeout was reached.
     // -------------------------------------------------------------------------
-    bool WriteLock(duration timeout = duration::max())
+    bool WriteLock(duration timeout = (duration::max)())
     {
         // Acquire the mutex to inspect and safely modify the lock state.
         std::unique_lock lk(m_mtx);
@@ -360,7 +360,7 @@ public:
         bool acquired = false;
         
         // Sleep on the condition variable until the predicate is satisfied or timeout expires.
-        if (timeout == duration::max())
+        if (timeout == (duration::max)())
         {
             m_cvWriters.wait(lk, predicate);
             acquired = true;

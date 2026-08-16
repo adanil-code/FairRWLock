@@ -46,3 +46,28 @@ target_include_directories(test_fair_rw_lock PRIVATE
 
 # Link platform-specific threading library
 target_link_libraries(test_fair_rw_lock PRIVATE Threads::Threads)
+
+# -----------------------------------------------------------------------------
+# NUMA Support Configuration
+# -----------------------------------------------------------------------------
+option(ENABLE_NUMA "Enable NUMA support in FairRWLock" OFF)
+
+if(ENABLE_NUMA)
+    if(APPLE)
+        message(WARNING "NUMA support is not available on macOS. Disabling ENABLE_NUMA.")
+        set(ENABLE_NUMA OFF)
+    else()
+        # Inject the preprocessor definition into the test suite compilation
+        target_compile_definitions(test_fair_rw_lock PRIVATE ENABLE_NUMA=1)
+        
+        # Resolve libnuma strictly for Linux when enabled
+        if(CMAKE_SYSTEM_NAME MATCHES "Linux")
+            find_library(NUMA_LIB numa)
+            if(NUMA_LIB)
+                target_link_libraries(test_fair_rw_lock PRIVATE ${NUMA_LIB})
+            else()
+                message(WARNING "libnuma not found. Linkage will fail if NUMA topology functions are strictly required.")
+            endif()
+        endif()
+    endif()
+endif()

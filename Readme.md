@@ -10,6 +10,7 @@ Designed for high-concurrency C++20 environments where throughput is critical, b
 * **Deterministic Fairness Escalation** preventing starvation through explicit policy thresholds.
 * **Logical Baton Handoff** explicitly identifying and notifying the next eligible waiter.
 * **Configurable Fairness Policy** allowing starvation thresholds, writer batching, and escalation behavior to be tuned for different workloads.
+* **NUMA-Aware Scaling** optionally distributing reader counts across physical sockets to eliminate fast-path cache-line bouncing.
 
 ⚠️ **Note:** This lock is designed for high-concurrency scenarios such as high-frequency trading order books, ETW/EDR telemetry pipelines, and centralized routing tables.
 
@@ -72,6 +73,11 @@ atomic increment
 This allows the common uncontended reader case to avoid the internal queue lock entirely.
 
 Writers use a compare-and-swap (CAS) operation on the packed state. If the lock is immediately available and the configured fairness limits permit acquisition, the writer can acquire without entering the slow path.
+
+### NUMA-Aware Distributed Readers (Optional)
+When the `EnableNUMA` template parameter is `true` and multiple CPU sockets are detected, the lock distributes reader counts across over-aligned stripe arrays. Fast-path readers exclusively increment their localized stripe, eliminating cache-line bouncing on the central state interconnect. Writers assert a global barricade and dynamically drain the distributed counts. 
+
+If the template parameter `EnableNUMA` is set to `false`, no NUMA-related code is compiled or linked into the binary, ensuring zero overhead on single-socket architectures.
 
 ### Slow Path: Managed Wait Queues
 When the fast path cannot safely grant access, the operation enters the slow path.
@@ -216,14 +222,16 @@ The lock separates the common uncontended case from contention management.
 The fast path is deliberately small. The slow path contains the fairness machinery.
 
 ### 4.2 64-Bit State Packing
+
 The primary lock state is stored in `std::atomic<uint64_t> m_state`.
 The state is divided into an upper 32-bit writer streak and a lower 32-bit state field.
 
 ```text
-63                         32 31       28 27       0
-+----------------------------+-----------+-----------+
-| Consecutive writer count   |  flags    |  readers  |
-+----------------------------+-----------+-----------+
+63                         32 31    30    29    28    27    26         0
++----------------------------+-----+-----+-----+-----+-----+-----------+
+| Consecutive writer count   |wait |write| un- |starv|guard|  readers  |
+|                            |ers  |lock | used|ing  |     |           |
++----------------------------+-----+-----+-----+-----+-----+-----------+
 ```
 
 The lower 32 bits contain:
@@ -427,12 +435,12 @@ The primary architectural difference is that `MomentumRWLock` performs its state
 * **Cross-Platform Determinism:** When you require identical lock-arbitration and admission semantics across Windows, Linux, and macOS. It normalizes behavior so you are not subjected to the whims of the OS scheduler (such as 100% POSIX writer starvation on Linux, or 50+ ms SRW latency spikes on Windows).
 * **Zero-Allocation Contention Paths:** When your hot paths strictly forbid heap allocations. The intrusive queue allocates `WriterNode` structures directly on the waiting thread's stack.
 * **Architecture-Specific Tuning:** When deploying to platforms with known false-sharing footprints, allowing you to leverage the explicit 128-byte cache-line padding (e.g., Apple Silicon / ARM64).
+* **NUMA / High-Core-Count Read Scaling:** When deploying to 64+ core server topologies where read traffic is continuous and highly parallel. Enabling the `EnableNUMA` parameter distributes reader counts across physical sockets, preventing global L1 cache-line invalidation on the central `m_state` counter.
 
 ### ❌ When Not to Use
 
-* **Massive NUMA / High-Core-Count Read Scaling:** If you are deploying to 64+ core server topologies where read traffic is continuous and highly parallel, the single atomic `m_state` counter will become a bottleneck due to global L1 cache-line invalidation (ping-ponging). For extreme read-scaling on multi-socket machines, consider cache-striped deferred locks like `folly::SharedMutex`.
 * **Hard Real-Time Systems:** If your architecture requires strict Worst-Case Execution Time (WCET) bounds, this lock's graceful degradation and yield backoffs are inappropriate. Use a strict Phase-Fair lock (`pflock`) instead.
-* **Low-Contention General Purpose Logic:** If thread starvation is not a measured issue in your application profile, the standard `std::shared_mutex` provides a simpler dependency and perfectly adequate performance.
+* **Low-Contention General Purpose Logic:** If thread starvation is not a measured issue in your application profile, the standard `std::shared_mutex` provides a simpler dependency and adequate performance.
 
 ---
 
@@ -467,6 +475,14 @@ void WriteData()
 }
 ```
 
+### Enabling NUMA Support
+To instantiate a NUMA-aware lock, pass `true` as the second template parameter:
+
+```cpp
+// Instantiates the lock with NUMA-aware reader distribution
+FairRWLock<DefaultFairRWLockPolicy, true> numaRwLock;
+```
+
 ### Custom Fairness Policy
 The policy can be configured when constructing the lock:
 
@@ -483,32 +499,10 @@ struct PersistencePolicy : DefaultFairRWLockPolicy
     static constexpr auto starvationThreshold = 4ms;
 };
 
-FairRWLock<PersistencePolicy> rwLock;
+FairRWLock<PersistencePolicy> customLock;
 ```
 
 The policy should be tuned according to the workload rather than treated as a universal optimal configuration.
-
-### Manual Locking
-Manual locking is also supported:
-
-```cpp
-if (rwLock.ReadLock(10ms))
-{
-    // Protected read access.
-    rwLock.ReadUnlock();
-}
-```
-
-For writes:
-
-```cpp
-if (rwLock.WriteLock(50ms))
-{
-    // Protected write access.
-    rwLock.WriteUnlock();
-}
-```
-
 ---
 
 ## 9. Benchmarks & Scaling Performance
@@ -637,56 +631,71 @@ The repository is organized into distinct layers to separate the core lock logic
     * `momentum_rw_lock.h`: Provided for reference; a momentum RW lock (manages lock handover to pass control between reading and writing phases).
 ---
 
-## 11. Building test code
+## 11. Building Test Code
 
 ### Linux / macOS
-Requires a C++20 compliant compiler (GCC or Clang).
+Requires a C++20 compliant compiler (GCC or Clang). 
+
+If you are compiling a NUMA-aware build on Linux, you must install the `libnuma` development packages first:
+
+```bash
+# Ubuntu / Debian
+sudo apt-get update
+sudo apt-get install libnuma-dev numactl
+
+# RHEL / Fedora / CentOS
+sudo dnf install numactl-devel
+```
 
 *Using the Build Script (Recommended)*
 
-./build.sh [--clean | -c] [--type Release | Debug] [--compiler g++ | clang++]
+```bash
+./build.sh [--clean | -c] [--type Release | Debug] [--compiler g++ | clang++] [--numa]
+```
 
 ```text
 Defaults:
  - Build type: Release
  - Compiler: g++
  - Reuses existing build/
+ - NUMA support: OFF
 
 Options:
- -c, --clean → Remove build/ before building
- -t, --type  → Set build type (Release or Debug)
- --compiler  → Choose compiler (g++ or clang++)
- -h, --help  → Show help and exit
+ -c, --clean     → Remove build/ before building
+ -t, --type      → Set build type (Release or Debug)
+ --compiler      → Choose compiler (g++ or clang++)
+ --numa          → Enable NUMA-aware lock capabilities in the build
+ -h, --help      → Show help and exit
  ```
 
 ```bash
- #Set permissions (once):
-chmod +x ./build.sh
-
 # Standard Release build using default C++ compiler
 ./build.sh
 
-# Clean Release build using clang++ (Optimized for macOS or specific Linux tests)
-./build.sh --clean --type Release --compiler clang++
-
-# Debug build for troubleshooting
-./build.sh --clean --type Debug
+# Clean Release build with NUMA support enabled
+./build.sh --clean --type Release --numa
 ```
 
-*Using CMake*
+*Using CMake Manually*
 
-The included CMakeLists.txt automatically detects your platform, handles threading library links (`Threads::Threads`), and configures optimized build flags (including IPO/LTO).
+The included `CMakeLists.txt` automatically detects your platform, handles threading library links, and configures optimized build flags (including IPO/LTO). To enable NUMA-aware locks, pass `-DENABLE_NUMA=ON` to the configuration step.
 
 ```bash
     mkdir build && cd build
-    cmake .. -DCMAKE_BUILD_TYPE=Release
+    cmake .. -DCMAKE_BUILD_TYPE=Release -DENABLE_NUMA=ON
     cmake --build . -j $(nproc 2>/dev/null || sysctl -n hw.ncpu)
 ```
+
+*Without CMake or `build.sh`*
+
+If you are integrating `fair_rw_lock.h` directly into your own build system and require NUMA support on Linux, you must explicitly inject the `ENABLE_NUMA=1` preprocessor definition (e.g., `#define ENABLE_NUMA=1` or `-DENABLE_NUMA=1` in your compiler flags) and ensure your binary links against `libnuma` (`-lnuma`).
 
 ### Windows
 Native Visual Studio 2026 Solution (.slnx) and Project (.vcxproj) files are included in the repository.
 
-* **Visual Studio 2026:** Requires C++20 support (`v145` toolset). 
+* **Visual Studio 2026:** Requires C++20 support (`v145` toolset). The provided project file includes target builds `Debug`/`Release` for non-NUMA aware lock compilation and `Debug-NUMA`/`Release-NUMA` for NUMA-aware lock compilation.
+
+---
 
 ## 12. Conclusion
 

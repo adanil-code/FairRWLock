@@ -49,7 +49,7 @@
 //   is cleared.
 // -------------------------------------------------------------------------
 
-constexpr uint32_t INFINITE = static_cast<uint32_t>(-1);
+constexpr uint32_t INFINITE_TIME = static_cast<uint32_t>(-1);
 
 class MomentumRWLock
 {
@@ -130,7 +130,7 @@ public:
     {
     public:
         // Attempts to acquire a read lock, optionally bound by a timeout.
-        explicit ReadGuard(MomentumRWLock& l, uint32_t milliseconds = INFINITE) : m_lock(&l)
+        explicit ReadGuard(MomentumRWLock& l, uint32_t milliseconds = INFINITE_TIME) : m_lock(&l)
         {
             m_locked = m_lock->ReadLock(milliseconds);
         }
@@ -191,7 +191,7 @@ public:
     {
     public:
         // Attempts to acquire an exclusive write lock, optionally bound by a timeout.
-        explicit WriteGuard(MomentumRWLock& l, uint32_t milliseconds = INFINITE) : m_lock(&l)
+        explicit WriteGuard(MomentumRWLock& l, uint32_t milliseconds = INFINITE_TIME) : m_lock(&l)
         {
             m_locked = m_lock->WriteLock(milliseconds);
         }
@@ -272,7 +272,7 @@ public:
         bool acquired = false;
 
         // Sleep on the condition variable until the predicate is satisfied or timeout expires.
-        if (Milliseconds == INFINITE)
+        if (Milliseconds == INFINITE_TIME)
         {
             m_readerCond.wait(lock, predicate);
             acquired = true; // wait ensures predicate is true upon waking
@@ -357,7 +357,7 @@ public:
         bool acquired = false;
 
         // Sleep on the condition variable until the predicate is satisfied or timeout expires.
-        if (Milliseconds == INFINITE)
+        if (Milliseconds == INFINITE_TIME)
         {
             m_writerCond.wait(lock, predicate);
             acquired = true;
