@@ -492,7 +492,7 @@ public:
     // Manual Locking Interface
     // -------------------------------------------------------------------------
 
-    // -------------------------------------------------------------------------
+// -------------------------------------------------------------------------
     // Acquires shared read access. 
     // Blocks the thread until the lock is acquired or the optional timeout
     // expires.
@@ -500,6 +500,15 @@ public:
     // -------------------------------------------------------------------------
     bool ReadLock(duration timeout = (duration::max)())
     {
+        // --- TTA (Test-and-Test-and-Add) Fast-Path Filter ---
+        // Prevents speculative RMW cache invalidation storms when lock is held.
+        uint64_t current_s = m_state.load(std::memory_order_relaxed);
+        
+        if ((current_s & (WRITE_LOCKED | WRITER_STARVING)) != 0) [[unlikely]]
+        {
+            return slow_read_lock(timeout);
+        }
+
         if constexpr (EnableNUMA)
         {
             // Dynamically bypasses distributed logic when running strictly on a single node
@@ -532,9 +541,9 @@ public:
                 
                 if (old_c == 1 && get_total_readers() == 0)
                 {                    
-                    uint64_t current_s = m_state.load(std::memory_order_seq_cst);
+                    uint64_t current_s_seq = m_state.load(std::memory_order_seq_cst);
                     
-                    if ((current_s & HAS_WAITERS) && !(current_s & WRITE_LOCKED)) [[unlikely]]
+                    if ((current_s_seq & HAS_WAITERS) && !(current_s_seq & WRITE_LOCKED)) [[unlikely]]
                     {
                         slow_read_unlock();
                     }
@@ -599,43 +608,49 @@ public:
             // to maximize L1 cache locality and avoid hashing overhead.
             if (NumaTopology<EnableNUMA>::is_multi_node) 
             {
-                size_t idx = get_stripe_index();
+                uint64_t current_s = m_state.load(std::memory_order_relaxed);
                 
-                // memory_order_seq_cst enforces strict Store-Load ordering across ARM/PowerPC
-                m_numaState.stripes[idx].count.fetch_add(1, 
-                                                         std::memory_order_seq_cst);
-                
-                // Fetch the central state to check for writer barricades or starvation flags.                
-                uint64_t s = m_state.load(std::memory_order_seq_cst);
-
-                // Fast Path: Only successfully acquired if no writers are active/starving.
-                if ((s & (WRITE_LOCKED | WRITER_STARVING)) == 0) [[likely]]
+                // --- TTA Fast-Path Filter ---
+                if ((current_s & (WRITE_LOCKED | WRITER_STARVING)) == 0) [[likely]]
                 {
-                    if ((s >> 32) > 0) [[unlikely]]
-                    {
-                        m_state.fetch_and(STATE_MASK, 
-                                          std::memory_order_relaxed);
-                    }
+                    size_t idx = get_stripe_index();
                     
-                    return true;
-                }
+                    // memory_order_seq_cst enforces strict Store-Load ordering across ARM/PowerPC
+                    m_numaState.stripes[idx].count.fetch_add(1, 
+                                                             std::memory_order_seq_cst);
+                    
+                    // Fetch the central state to check for writer barricades or starvation flags.                
+                    uint64_t s = m_state.load(std::memory_order_seq_cst);
 
-                // Contention detected. We must rollback the speculative local increment.
-                //
-                // Sequential consistency (SeqCst) is mandatory here. If Thread A and Thread B 
-                // rollback simultaneously on different stripes, the hardware memory fence 
-                // guarantees at least one thread observes get_total_readers() == 0 and triggers 
-                // the slow_read_unlock() baton pass, preventing queued writers from starving indefinitely.
-                uint32_t old_c = m_numaState.stripes[idx].count.fetch_sub(1, 
-                                                                          std::memory_order_seq_cst);
-                
-                if (old_c == 1 && get_total_readers() == 0)
-                {                    
-                    uint64_t current_s = m_state.load(std::memory_order_seq_cst);
+                    // Fast Path: Only successfully acquired if no writers are active/starving.
+                    if ((s & (WRITE_LOCKED | WRITER_STARVING)) == 0) [[likely]]
+                    {
+                        if ((s >> 32) > 0) [[unlikely]]
+                        {
+                            m_state.fetch_and(STATE_MASK, 
+                                              std::memory_order_relaxed);
+                        }
+                        
+                        return true;
+                    }
+
+                    // Contention detected. We must rollback the speculative local increment.
+                    //
+                    // Sequential consistency (SeqCst) is mandatory here. If Thread A and Thread B 
+                    // rollback simultaneously on different stripes, the hardware memory fence 
+                    // guarantees at least one thread observes get_total_readers() == 0 and triggers 
+                    // the slow_read_unlock() baton pass, preventing queued writers from starving indefinitely.
+                    uint32_t old_c = m_numaState.stripes[idx].count.fetch_sub(1, 
+                                                                              std::memory_order_seq_cst);
                     
-                    if ((current_s & HAS_WAITERS) && !(current_s & WRITE_LOCKED)) [[unlikely]]
-                    {                        
-                        slow_read_unlock(); 
+                    if (old_c == 1 && get_total_readers() == 0)
+                    {                    
+                        uint64_t current_s_seq = m_state.load(std::memory_order_seq_cst);
+                        
+                        if ((current_s_seq & HAS_WAITERS) && !(current_s_seq & WRITE_LOCKED)) [[unlikely]]
+                        {                        
+                            slow_read_unlock(); 
+                        }
                     }
                 }
 
@@ -649,12 +664,13 @@ public:
                 }
 
                 check_and_trigger_override_unlocked();
-                s = m_state.load(std::memory_order_relaxed);
+                uint64_t s = m_state.load(std::memory_order_relaxed);
                 
                 // Attempt to acquire the read lock while holding the queue lock.
                 while (can_reader_acquire_unlocked(s))
                 {
                     // Apply local stripe increment first
+                    size_t idx = get_stripe_index();
                     m_numaState.stripes[idx].count.fetch_add(1, 
                                                              std::memory_order_seq_cst);
                     
@@ -678,8 +694,8 @@ public:
                     }
                     
                     // Global state shifted (e.g., a writer snuck in). Rollback and evaluate handoff.
-                    old_c = m_numaState.stripes[idx].count.fetch_sub(1, 
-                                                                     std::memory_order_seq_cst);
+                    uint32_t old_c = m_numaState.stripes[idx].count.fetch_sub(1, 
+                                                                              std::memory_order_seq_cst);
                     
                     if (old_c == 1 && get_total_readers() == 0)
                     {
@@ -696,42 +712,48 @@ public:
             }
         }
 
-        // Lock-Free Acquisition: Bypasses CAS loops for O(N) throughput.        
-        // Falls through here if EnableNUMA=false or multi_node=false.
-        uint64_t s = m_state.fetch_add(READ_INC, 
-                                       std::memory_order_acquire);
+        uint64_t current_s = m_state.load(std::memory_order_relaxed);
         
-        // Guard against bitmask overflow.
-        if ((s & OVERFLOW_GUARD) != 0) [[unlikely]]
+        // --- TTA Fast-Path Filter ---
+        if ((current_s & (WRITE_LOCKED | WRITER_STARVING)) == 0) [[likely]]
         {
-            // Rollback if maximum reader capacity is reached.
-            m_state.fetch_sub(READ_INC, 
-                              std::memory_order_release);
-                              
-            return false;
-        }
-
-        // Fast Path: Check if no writers are active and no writers are starving.
-        if ((s & (WRITE_LOCKED | WRITER_STARVING)) == 0) [[likely]]
-        {
-            // Clear the consecutive writer streak if present.
-            if ((s >> 32) > 0) [[unlikely]]
-            {                
-                m_state.fetch_and(STATE_MASK, 
-                                  std::memory_order_relaxed);
+            // Lock-Free Acquisition: Bypasses CAS loops for O(N) throughput.        
+            // Falls through here if EnableNUMA=false or multi_node=false.
+            uint64_t s = m_state.fetch_add(READ_INC, 
+                                           std::memory_order_acquire);
+            
+            // Guard against bitmask overflow.
+            if ((s & OVERFLOW_GUARD) != 0) [[unlikely]]
+            {
+                // Rollback if maximum reader capacity is reached.
+                m_state.fetch_sub(READ_INC, 
+                                  std::memory_order_release);
+                                  
+                return false;
             }
 
-            return true;
-        }
+            // Fast Path: Check if no writers are active and no writers are starving.
+            if ((s & (WRITE_LOCKED | WRITER_STARVING)) == 0) [[likely]]
+            {
+                // Clear the consecutive writer streak if present.
+                if ((s >> 32) > 0) [[unlikely]]
+                {                
+                    m_state.fetch_and(STATE_MASK, 
+                                      std::memory_order_relaxed);
+                }
 
-        // Rollback the speculative increment because the lock is contended.
-        uint64_t old_s = m_state.fetch_sub(READ_INC, 
-                                           std::memory_order_release);
-        
-        // Critical Baton Pass: Wake waiting threads if we were the last reader.
-        if ((old_s & READ_MASK) == 1 && (old_s & HAS_WAITERS) && !(old_s & WRITE_LOCKED)) [[unlikely]]
-        {            
-            slow_read_unlock();
+                return true;
+            }
+
+            // Rollback the speculative increment because the lock is contended.
+            uint64_t old_s = m_state.fetch_sub(READ_INC, 
+                                               std::memory_order_release);
+            
+            // Critical Baton Pass: Wake waiting threads if we were the last reader.
+            if ((old_s & READ_MASK) == 1 && (old_s & HAS_WAITERS) && !(old_s & WRITE_LOCKED)) [[unlikely]]
+            {            
+                slow_read_unlock();
+            }
         }
 
         // Try to acquire the slow-path queue lock without blocking.
@@ -746,7 +768,7 @@ public:
 
         // Evaluate if Override Mode needs to be activated.
         check_and_trigger_override_unlocked();
-        s = m_state.load(std::memory_order_relaxed);
+        uint64_t s = m_state.load(std::memory_order_relaxed);
         
         // Attempt to acquire the read lock while holding the queue lock.
         while (can_reader_acquire_unlocked(s))
@@ -1131,7 +1153,7 @@ private:
         time_point            ts;
     };
 
-    // -------------------------------------------------------------------------
+// -------------------------------------------------------------------------
     // Test-and-Test-and-Set (TTAS) Spinlock Guard
     // Safely replaces std::unique_lock for low-level queue pointer manipulation.
     // -------------------------------------------------------------------------
@@ -1158,11 +1180,22 @@ private:
 
         void lock()
         {
+            int backoff = 1;
+            constexpr int MAX_BACKOFF = 64;
+
             while (m_flag->test_and_set(std::memory_order_acquire))
             {
                 while (m_flag->test(std::memory_order_relaxed))
                 {
-                    cpu_relax_pause();
+                    // Exponential backoff to prevent interconnect flooding (Thundering Herd)
+                    // and mitigate 1-cycle yield instruction saturation on ARM64.
+                    for (int i = 0; i < backoff; ++i)
+                    {
+                        cpu_relax_pause();
+                    }
+                    
+                    // Enclosed std::min in parentheses to bypass Windows min/max macros
+                    backoff = (std::min)(backoff << 1, MAX_BACKOFF);
                 }
             }
             
@@ -1243,17 +1276,12 @@ private:
             }
 
             // Constant-initialized TLS guarantees zero runtime allocation cost
-            thread_local const int tls_dummy = 0;
-            uint64_t x = static_cast<uint64_t>(reinterpret_cast<std::uintptr_t>(&tls_dummy));
-
-            // SplitMix64 avalanche algorithm diffuses the pointer address bits.
-            // This ensures threads allocated in similar memory regions do not collide.
-            x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ULL;
-            x = (x ^ (x >> 27)) * 0x94d049bb133111ebULL;
-            x = x ^ (x >> 31);
+            static std::atomic<size_t> global_thread_counter{ 0 };
+            thread_local const size_t thread_id = global_thread_counter.fetch_add(1, 
+                                                                                  std::memory_order_relaxed);
 
             // Exploits zero-cost bitwise modulo since num_stripes is a power of 2
-            return x & (NumaTopology<EnableNUMA>::num_stripes - 1);
+            return thread_id & (NumaTopology<EnableNUMA>::num_stripes - 1);
         }
         else
         {
