@@ -60,11 +60,24 @@ extern "C"
 #endif
 
 // ----------------------------------------------------------------------------
+// Compiler Inlining Directives
+// Forces the compiler to respect inline boundaries on ultra-hot path helpers
+// to avoid instruction pipeline pollution and function call overhead.
+// ----------------------------------------------------------------------------
+#if defined(_MSC_VER)
+#define FAIR_FORCE_INLINE __forceinline
+#elif defined(__GNUC__) || defined(__clang__)
+#define FAIR_FORCE_INLINE inline __attribute__((always_inline))
+#else
+#define FAIR_FORCE_INLINE inline
+#endif
+
+// ----------------------------------------------------------------------------
 // CPU Relax / Pause Hint
 // Emits a hardware-level pause instruction to reduce memory bus contention 
 // during brief spin-wait cycles.
 // ----------------------------------------------------------------------------
-inline void cpu_relax_pause() noexcept
+FAIR_FORCE_INLINE void cpu_relax_pause() noexcept
 {
 #if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
     _mm_pause();
@@ -492,7 +505,7 @@ public:
     // Manual Locking Interface
     // -------------------------------------------------------------------------
 
-// -------------------------------------------------------------------------
+    // -------------------------------------------------------------------------
     // Acquires shared read access. 
     // Blocks the thread until the lock is acquired or the optional timeout
     // expires.
@@ -527,8 +540,7 @@ public:
                 {
                     if ((s >> 32) > 0) [[unlikely]]
                     {                
-                        m_state.fetch_and(STATE_MASK, 
-                                          std::memory_order_relaxed);
+                        clear_writer_streak_unlocked();
                     }
                     
                     return true;
@@ -570,12 +582,9 @@ public:
         // Fast Path: Only successfully acquired if no writers are active/starving.
         if ((s & (WRITE_LOCKED | WRITER_STARVING)) == 0) [[likely]]
         {
-            // Safely and idempotently clear the consecutive writer streak 
-            // from the upper 32 bits without risking active reader logic.
             if ((s >> 32) > 0) [[unlikely]]
             {                
-                m_state.fetch_and(STATE_MASK, 
-                                  std::memory_order_relaxed);
+                clear_writer_streak_unlocked();
             }
 
             return true;
@@ -627,8 +636,7 @@ public:
                     {
                         if ((s >> 32) > 0) [[unlikely]]
                         {
-                            m_state.fetch_and(STATE_MASK, 
-                                              std::memory_order_relaxed);
+                            clear_writer_streak_unlocked();
                         }
                         
                         return true;
@@ -682,12 +690,9 @@ public:
                         m_batchWriters.store(0, 
                                              std::memory_order_relaxed);
                                              
-                        // Clear the consecutive writer streak from the upper 32 bits to prevent
-                        // NUMA streak leakage.
                         if ((s >> 32) > 0) [[unlikely]]
                         {                
-                            m_state.fetch_and(STATE_MASK, 
-                                              std::memory_order_relaxed);
+                            clear_writer_streak_unlocked();
                         }
                                              
                         return true;
@@ -735,11 +740,9 @@ public:
             // Fast Path: Check if no writers are active and no writers are starving.
             if ((s & (WRITE_LOCKED | WRITER_STARVING)) == 0) [[likely]]
             {
-                // Clear the consecutive writer streak if present.
                 if ((s >> 32) > 0) [[unlikely]]
                 {                
-                    m_state.fetch_and(STATE_MASK, 
-                                      std::memory_order_relaxed);
+                    clear_writer_streak_unlocked();
                 }
 
                 return true;
@@ -938,42 +941,9 @@ public:
                                                     std::memory_order_seq_cst, 
                                                     std::memory_order_relaxed)) [[likely]]
                 {
-                    if constexpr (EnableNUMA)
+                    if (!wait_for_numa_readers_or_rollback_unlocked(consec, next_consec, false))
                     {
-                        // A reader thread could have executed its fetch_add() on a remote NUMA node 
-                        // strictly in the nanoseconds between our `readers_clear` evaluation and the CAS 
-                        // execution.
-                        if (NumaTopology<EnableNUMA>::is_multi_node && get_total_readers() > 0)
-                        {
-                            // A reader snuck in. We implement a highly bounded spin to avoid phantom aborts
-                            // while rigidly maintaining the non-blocking TryLock specification.
-                            bool readers_cleared = false;
-                            
-                            for (int i = 0; i < 32; ++i)
-                            {
-                                if (get_total_readers() == 0)
-                                {
-                                    readers_cleared = true;
-                                    break;
-                                }
-                                
-                                cpu_relax_pause();
-                            }
-                            
-                            if (!readers_cleared)
-                            {
-                                // Revert the speculative writer streak increment before aborting
-                                // to prevent permanently polluting the fairness tracker.
-                                if (next_consec > consec)
-                                {
-                                    m_state.fetch_sub(1ULL << 32, 
-                                                      std::memory_order_relaxed);
-                                }
-
-                                WriteUnlock();
-                                return false;
-                            }
-                        }
+                        return false;
                     }
                     
                     drain_numa_readers();
@@ -1015,48 +985,12 @@ public:
                 // Drop the queue lock first to minimize OS-level critical section time.
                 lk.unlock();
                 
-                if constexpr (EnableNUMA)
+                if (!wait_for_numa_readers_or_rollback_unlocked(consec, next_consec, true))
                 {
-                    // Exact same TOCTOU rollback applies when acquiring via the slow-path loop.
-                    if (NumaTopology<EnableNUMA>::is_multi_node && get_total_readers() > 0)
-                    {
-                        bool readers_cleared = false;
-                        
-                        for (int i = 0; i < 32; ++i)
-                        {
-                            if (get_total_readers() == 0)
-                            {
-                                readers_cleared = true;
-                                break;
-                            }
-                            
-                            cpu_relax_pause();
-                        }
-                        
-                        if (!readers_cleared)
-                        {
-                            // Revert the speculative writer streak increment safely before aborting
-                            if (next_consec > consec)
-                            {
-                                m_state.fetch_sub(1ULL << 32, 
-                                                  std::memory_order_relaxed);
-                            }
-                            
-                            // Revert the batch writer increment if override was active
-                            if (m_writerOverride.load(std::memory_order_relaxed))
-                            {
-                                m_batchWriters.fetch_sub(1, 
-                                                         std::memory_order_relaxed);
-                            }
-
-                            WriteUnlock();
-                            return false;
-                        }
-                    }
+                    return false;
                 }
                 
                 drain_numa_readers();
-
                 return true;
             }
         }
@@ -1153,7 +1087,7 @@ private:
         time_point            ts;
     };
 
-// -------------------------------------------------------------------------
+    // -------------------------------------------------------------------------
     // Test-and-Test-and-Set (TTAS) Spinlock Guard
     // Safely replaces std::unique_lock for low-level queue pointer manipulation.
     // -------------------------------------------------------------------------
@@ -1329,6 +1263,83 @@ private:
         }
     }
 
+    // Ensures the upper 32-bit consecutive writer tracker is safely zeroed by the 
+    // first reader that acquires the lock, cleanly avoiding an erasure race 
+    // against new writers via a weak CAS loop.
+    FAIR_FORCE_INLINE void clear_writer_streak_unlocked() noexcept
+    {
+        uint64_t st = m_state.load(std::memory_order_relaxed);
+        
+        // Fast-exit to prevent intense CAS spin-storms if another reader already cleared it
+        if ((st >> 32) == 0)
+        {
+            return; 
+        }
+        
+        while ((st >> 32) > 0 && (st & WRITE_LOCKED) == 0)
+        {
+            if (m_state.compare_exchange_weak(st, 
+                                              st & STATE_MASK, 
+                                              std::memory_order_relaxed, 
+                                              std::memory_order_relaxed))
+            {
+                break;
+            }
+        }
+    }
+
+    // Evaluates TOCTOU constraints on NUMA distributed arrays and handles rollbacks if boundaries are breached.
+    FAIR_FORCE_INLINE bool wait_for_numa_readers_or_rollback_unlocked(uint32_t consec, uint32_t next_consec, bool is_slow_path) noexcept
+    {
+        if constexpr (EnableNUMA)
+        {
+            // Exact same TOCTOU rollback applies whether acquiring via fast-path or slow-path loop.
+            // A reader thread could have executed its fetch_add() on a remote NUMA node 
+            // strictly in the nanoseconds between our `readers_clear` evaluation and the CAS execution.
+            if (NumaTopology<EnableNUMA>::is_multi_node && get_total_readers() > 0)
+            {
+                // A reader snuck in. We implement a highly bounded spin to avoid phantom aborts
+                // while rigidly maintaining the non-blocking TryLock specification.
+                bool readers_cleared = false;
+                
+                for (int i = 0; i < 32; ++i)
+                {
+                    if (get_total_readers() == 0)
+                    {
+                        readers_cleared = true;
+                        break;
+                    }
+                    
+                    cpu_relax_pause();
+                }
+                
+                if (!readers_cleared)
+                {
+                    // Revert the speculative writer streak increment before aborting
+                    // to prevent permanently polluting the fairness tracker.
+                    if (next_consec > consec)
+                    {
+                        m_state.fetch_sub(1ULL << 32, 
+                                          std::memory_order_relaxed);
+                    }
+                    
+                    // Revert the batch writer increment if override was active
+                    if (is_slow_path && m_writerOverride.load(std::memory_order_relaxed))
+                    {
+                        m_batchWriters.fetch_sub(1, 
+                                                 std::memory_order_relaxed);
+                    }
+
+                    WriteUnlock();
+                    
+                    return false;
+                }
+            }
+        }
+        
+        return true;
+    }
+
     // Handles locking when the fast-path fails for readers.
     // Registers the reader in the wait counter and waits on the reader condition variable.
     bool slow_read_lock(duration timeout)
@@ -1352,7 +1363,7 @@ private:
         check_and_trigger_override_unlocked();
 
         time_point deadline = (timeout == (duration::max)()) ? (time_point::max)() : clock::now() + timeout;
-        bool acquired = false;
+        bool       acquired = false;
 
         while (true)
         {
@@ -1384,12 +1395,9 @@ private:
                                                  std::memory_order_relaxed);
                             acquired = true;
                             
-                            // Clear the consecutive writer streak from the upper 32 bits to
-                            // prevent NUMA streak leakage.
                             if ((s >> 32) > 0) [[unlikely]]
                             {                
-                                m_state.fetch_and(STATE_MASK, 
-                                                  std::memory_order_relaxed);
+                                clear_writer_streak_unlocked();
                             }
                             
                             break;
@@ -1430,7 +1438,7 @@ private:
                         break;
                     }
                     
-                    continue; // Loop naturally re-evaluates if the CAS fails.
+                    continue; // Loop re-evaluates if the CAS fails.
                 }
             }
 
@@ -1484,12 +1492,9 @@ private:
                                                      std::memory_order_relaxed);
                                 acquired = true;
                                 
-                                // Clear the consecutive writer streak from the upper 32 bits to 
-                                // prevent NUMA streak leakage.
                                 if ((s >> 32) > 0) [[unlikely]]
                                 {                
-                                    m_state.fetch_and(STATE_MASK, 
-                                                      std::memory_order_relaxed);
+                                    clear_writer_streak_unlocked();
                                 }
                                 
                                 break;
@@ -1624,14 +1629,14 @@ private:
         // RAII guard ensures the node is safely unlinked if an exception occurs 
         // or the function returns early due to a timeout.
         ScopeUnlinker unlinker(this, &myNode);
-        time_point deadline = (timeout == (duration::max)()) ? (time_point::max)() : clock::now() + timeout;
+        time_point    deadline = (timeout == (duration::max)()) ? (time_point::max)() : clock::now() + timeout;
 
         // Establish the exact time this specific writer should trigger starvation mode.
         time_point starve_time = myNode.ts + Policy::starvationThreshold; 
-        bool asserted_starvation = false;
+        bool       asserted_starvation = false;
 
         bool acquired = false;
-        int yield_count = 0;
+        int  yield_count = 0;
 
         while (true)
         {
@@ -1639,7 +1644,7 @@ private:
             
             if (is_head)
             {
-                uint64_t s = m_state.load(std::memory_order_relaxed);
+                uint64_t s      = m_state.load(std::memory_order_relaxed);
                 uint32_t consec = static_cast<uint32_t>(s >> 32);
                 
                 // Graceful Degradation: If we hit a policy limit, back off briefly. 
@@ -1678,7 +1683,7 @@ private:
                 if (can_writer_acquire_unlocked(s, bypass_limits))
                 {
                     uint32_t next_consec = (consec < 0xFFFFFFFF) ? consec + 1 : consec;
-                    uint64_t next_s = (s | WRITE_LOCKED) & STATE_MASK;
+                    uint64_t next_s      = (s | WRITE_LOCKED) & STATE_MASK;
                     next_s |= (static_cast<uint64_t>(next_consec) << 32);
 
                     // Attempt to globally set the WRITE_LOCKED flag.
@@ -1742,14 +1747,14 @@ private:
                 
                 if (is_head)
                 {
-                    uint64_t s = m_state.load(std::memory_order_relaxed);
-                    uint32_t consec = static_cast<uint32_t>(s >> 32);
-                    bool bypass_limits = (yield_count >= Policy::maxYieldsBeforeBypass);
+                    uint64_t s             = m_state.load(std::memory_order_relaxed);
+                    uint32_t consec        = static_cast<uint32_t>(s >> 32);
+                    bool     bypass_limits = (yield_count >= Policy::maxYieldsBeforeBypass);
 
                     if (can_writer_acquire_unlocked(s, bypass_limits))
                     {
                         uint32_t next_consec = (consec < 0xFFFFFFFF) ? consec + 1 : consec;
-                        uint64_t next_s = (s | WRITE_LOCKED) & STATE_MASK;
+                        uint64_t next_s      = (s | WRITE_LOCKED) & STATE_MASK;
                         next_s |= (static_cast<uint64_t>(next_consec) << 32);
 
                         // Use a strong CAS for the final attempt to avoid spurious failures.
@@ -1797,7 +1802,7 @@ private:
         // Acquire the queue spinlock for safe queue manipulation.
         QueueLockGuard lk(m_queueLock);
         
-        uint64_t s = m_state.load(std::memory_order_relaxed);
+        uint64_t s      = m_state.load(std::memory_order_relaxed);
         uint32_t consec = static_cast<uint32_t>(s >> 32);
 
         // Check if any fairness caps were hit during this write phase.
@@ -1920,9 +1925,9 @@ private:
         if (was_head)
         {
             WriterNode* newHead = m_headWriter.load();
-            bool keep_starving = false;
+            bool        keep_starving = false;
 
-            uint64_t s = m_state.load(std::memory_order_relaxed);
+            uint64_t s      = m_state.load(std::memory_order_relaxed);
             uint32_t consec = static_cast<uint32_t>(s >> 32);
 
             // Preserve starvation if we are in override mode and limits haven't been breached.
@@ -2017,14 +2022,7 @@ private:
         // Safely check for active readers, accommodating distributed NUMA stripes if enabled.
         if constexpr (EnableNUMA) 
         {
-            if (NumaTopology<EnableNUMA>::is_multi_node) 
-            {
-                has_readers = (get_total_readers() > 0);
-            } 
-            else 
-            {
-                has_readers = ((s & READ_MASK) != 0);
-            }
+            has_readers = NumaTopology<EnableNUMA>::is_multi_node ? (get_total_readers() > 0) : ((s & READ_MASK) != 0);
         } 
         else 
         {

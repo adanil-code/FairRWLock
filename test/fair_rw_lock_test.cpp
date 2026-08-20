@@ -50,6 +50,7 @@ using TestFairRWLock = FairRWLock<Policy, USE_NUMA_CONFIG>;
 #if !defined(_WIN32)
 // POSIX (Linux, macOS)
 #include <sys/resource.h>
+#include <pthread.h>
 #endif
 
 #ifdef _WIN32
@@ -79,6 +80,7 @@ static void log_result(const char* name,
 static unsigned int get_hw_threads()
 {
     unsigned int hw = std::thread::hardware_concurrency();    
+    
     if (hw == 0)
     {
         hw = 4;
@@ -99,10 +101,10 @@ static unsigned int get_hw_threads()
 void reader_writer_race_test()
 {
     TestFairRWLock<> lock;
-    std::atomic<int> readers_inside = 0;
-    std::atomic<int> writers_inside = 0;
+    std::atomic<int>  readers_inside = 0;
+    std::atomic<int>  writers_inside = 0;
     std::atomic<bool> ok{true};
-    std::barrier start(10);
+    std::barrier      start(10);
 
     std::vector<std::thread> ts;
     
@@ -163,7 +165,7 @@ void reader_writer_race_test()
 // ----------------------------------------------------------------------------
 void writer_timeout_with_readers()
 {
-    TestFairRWLock<> lock;
+    TestFairRWLock<>  lock;
     std::atomic<bool> timed_out = false;
 
     lock.ReadLock();
@@ -193,7 +195,7 @@ void writer_timeout_with_readers()
 // ----------------------------------------------------------------------------
 void reader_timeout_with_writer()
 {
-    TestFairRWLock<> lock;
+    TestFairRWLock<>  lock;
     std::atomic<bool> timed_out = false;
 
     lock.WriteLock();
@@ -224,7 +226,7 @@ void reader_timeout_with_writer()
 void try_lock_under_contention_test()
 {
     TestFairRWLock<> lock;
-    bool ok = true;
+    bool             ok = true;
     
     lock.WriteLock();
     
@@ -288,7 +290,7 @@ void try_lock_under_contention_test()
 void raii_guard_functionality_test()
 {
     TestFairRWLock<> lock;
-    bool ok = true;
+    bool             ok = true;
 
     {
         TestFairRWLock<>::WriteGuard g(lock);
@@ -355,10 +357,10 @@ struct PunchesThroughPolicy : DefaultFairRWLockPolicy
 void writer_punches_through_readers_test()
 {
     TestFairRWLock<PunchesThroughPolicy> lock;
-    std::latch all_readers_in(5);
-    std::promise<void> release_p;
-    auto release = release_p.get_future().share();
-    std::atomic<bool> writer_done = false;
+    std::latch                           all_readers_in(5);
+    std::promise<void>                   release_p;
+    auto                                 release = release_p.get_future().share();
+    std::atomic<bool>                    writer_done = false;
 
     std::vector<std::thread> readers;
     
@@ -378,7 +380,7 @@ void writer_punches_through_readers_test()
     all_readers_in.wait();
 
     std::promise<void> writer_is_queued_p;
-    auto writer_is_queued_f = writer_is_queued_p.get_future();
+    auto               writer_is_queued_f = writer_is_queued_p.get_future();
     
     std::thread writer([&]()
     {
@@ -428,9 +430,9 @@ struct OverrideResetPolicy : DefaultFairRWLockPolicy
 void override_reset_test()
 {
     TestFairRWLock<OverrideResetPolicy> lock;
-    std::atomic<bool> reader_succeeded = false;
-    std::promise<void> writer_batch_done_p;
-    auto writer_batch_done_f = writer_batch_done_p.get_future();
+    std::atomic<bool>                   reader_succeeded = false;
+    std::promise<void>                  writer_batch_done_p;
+    auto                                writer_batch_done_f = writer_batch_done_p.get_future();
 
     lock.ReadLock();
 
@@ -503,8 +505,8 @@ struct ConsecLimitPolicy : DefaultFairRWLockPolicy
 void consecutive_limit_breaks_batch_test()
 {
     TestFairRWLock<ConsecLimitPolicy> lock;
-    std::atomic<int> order{0};
-    std::atomic<bool> reader_acquired{false};
+    std::atomic<int>                  order{0};
+    std::atomic<bool>                 reader_acquired{false};
 
     lock.WriteLock();
     lock.WriteUnlock();
@@ -512,7 +514,7 @@ void consecutive_limit_breaks_batch_test()
     lock.WriteLock();
 
     std::promise<void> reader_started_p;
-    auto reader_started_f = reader_started_p.get_future();
+    auto               reader_started_f = reader_started_p.get_future();
 
     std::thread reader([&]()
     {
@@ -557,7 +559,7 @@ void consecutive_limit_breaks_batch_test()
 // ----------------------------------------------------------------------------
 void writer_timeout_handoff_test()
 {
-    TestFairRWLock<> lock;
+    TestFairRWLock<>  lock;
     std::atomic<bool> w2_done = false;
 
     lock.ReadLock();
@@ -671,15 +673,15 @@ struct OverrideTimeslicePolicy : DefaultFairRWLockPolicy
 void override_timeslice_allows_reader_test()
 {
     TestFairRWLock<OverrideTimeslicePolicy> lock;
-    std::atomic<int> order{0};
-    std::atomic<bool> reader_got_in{false};
+    std::atomic<int>                        order{0};
+    std::atomic<bool>                       reader_got_in{false};
 
     std::promise<void> wA_is_queued_p;
-    auto wA_is_queued_f = wA_is_queued_p.get_future();
+    auto               wA_is_queued_f = wA_is_queued_p.get_future();
     std::promise<void> override_triggered_p;
-    auto override_triggered_f = override_triggered_p.get_future();
+    auto               override_triggered_f = override_triggered_p.get_future();
     std::promise<void> wA_has_lock_p;
-    auto wA_has_lock_sf = wA_has_lock_p.get_future().share();
+    auto               wA_has_lock_sf = wA_has_lock_p.get_future().share();
 
     lock.ReadLock();
 
@@ -748,8 +750,8 @@ void override_timeslice_allows_reader_test()
 // ----------------------------------------------------------------------------
 void multiple_writers_fairness_test()
 {
-    TestFairRWLock<> lock;
-    std::atomic<int> successes = 0;
+    TestFairRWLock<>         lock;
+    std::atomic<int>         successes = 0;
     std::vector<std::thread> writers;
     
     for (int i = 0; i < 4; ++i)
@@ -779,13 +781,13 @@ void multiple_writers_fairness_test()
 // ----------------------------------------------------------------------------
 void stress_liveness_test()
 {
-    TestFairRWLock<> lock;
+    TestFairRWLock<>   lock;
     const unsigned int hw_threads = get_hw_threads();
-    const int num_threads = std::max<int>(10u, hw_threads * 2); 
-    const int ops_per_thread = 300;
+    const int          num_threads = std::max<int>(10u, hw_threads * 2); 
+    const int          ops_per_thread = 300;
     
-    std::atomic<int> readers_inside = 0;
-    std::atomic<int> writers_inside = 0;
+    std::atomic<int>  readers_inside = 0;
+    std::atomic<int>  writers_inside = 0;
     std::atomic<bool> ok{true};
 
     std::vector<std::thread> threads;
@@ -873,9 +875,9 @@ struct NonRecursivePolicy : DefaultFairRWLockPolicy
 void non_recursive_reader_test()
 {
     TestFairRWLock<NonRecursivePolicy> lock;
-    std::atomic<bool> ok{true};
-    std::promise<void> writer_queued;
-    auto writer_f = writer_queued.get_future();
+    std::atomic<bool>                  ok{true};
+    std::promise<void>                 writer_queued;
+    auto                               writer_f = writer_queued.get_future();
     
     lock.ReadLock();
     
@@ -911,7 +913,7 @@ void non_recursive_reader_test()
 void zero_timeout_edge_case_test()
 {
     TestFairRWLock<> lock;
-    bool ok = true;
+    bool             ok = true;
 
     if (!lock.WriteLock(0s))
     {
@@ -961,12 +963,12 @@ void zero_timeout_edge_case_test()
 // ----------------------------------------------------------------------------
 void reader_thundering_herd_test()
 {
-    TestFairRWLock<> lock;
-    std::atomic<int> readers_in = 0;
+    TestFairRWLock<>  lock;
+    std::atomic<int>  readers_in = 0;
     std::atomic<bool> writer_done = false;
     
-    unsigned int num_readers = std::max<unsigned int>(10u, get_hw_threads() * 2);
-    std::barrier sync(num_readers + 1);
+    unsigned int      num_readers = std::max<unsigned int>(10u, get_hw_threads() * 2);
+    std::barrier      sync(num_readers + 1);
 
     lock.WriteLock();
 
@@ -1019,8 +1021,8 @@ struct StrictBatchPolicy : DefaultFairRWLockPolicy
 void strict_writer_batch_limit_test()
 {
     TestFairRWLock<StrictBatchPolicy> lock;
-    std::atomic<int> execution_order = 0;
-    std::atomic<int> reader_position = 0;
+    std::atomic<int>                  execution_order = 0;
+    std::atomic<int>                  reader_position = 0;
 
     lock.ReadLock();
 
@@ -1090,7 +1092,7 @@ void guard_move_assignment_test()
 {
     TestFairRWLock<> lock1;
     TestFairRWLock<> lock2;
-    bool ok = true;
+    bool             ok = true;
 
     {
         TestFairRWLock<>::WriteGuard g1(lock1);
@@ -1132,12 +1134,11 @@ void guard_move_assignment_test()
 // ----------------------------------------------------------------------------
 void max_duration_overflow_test()
 {
-    TestFairRWLock<> lock;
-    bool ok = true;
+    TestFairRWLock<>  lock;
+    bool              ok = true;
+    std::atomic<bool> reader_started = false;
     
     lock.WriteLock();
-
-    std::atomic<bool> reader_started = false;
     
     std::thread reader([&]()
     {
@@ -1166,30 +1167,34 @@ void max_duration_overflow_test()
 }
 
 // ============================================================================
-// Baseline Comparison Test (4-Way Lock Architecture Benchmarks)
+// Baseline Comparison Test (Multi-Way Lock Architecture Benchmarks)
 // ============================================================================
 
 struct WorkloadResult
 {
+    std::string         name;
     uint64_t            total_reads = 0;
     uint64_t            total_writes = 0;
+    uint64_t            total_ops = 0;
+    double              read_tp = 0.0;
+    double              write_tp = 0.0;
     std::vector<double> reader_latencies_ns;
     std::vector<double> writer_latencies_ns;
 };
 
 // ----------------------------------------------------------------------------
 // Complete performance benchmark testing FairRWLock against OS native 
-// std::shared_mutex, TextbookReaderPrefLock, and MomentumRWLock. Extracts 
-// operations-per-second throughput metrics and generates latency percentiles.
+// std::shared_mutex, TextbookReaderPrefLock, MomentumRWLock, and conditionally 
+// pthread_rwlock_t. Extracts ops/sec throughput metrics and latency percentiles.
 // ----------------------------------------------------------------------------
 void run_comparative_throughput_test()
 {
     const unsigned int hw_threads = get_hw_threads();
-    const int NUM_WRITERS = (hw_threads >= 3) ? 2 : 1;
-    int readers_calc = static_cast<int>(hw_threads) - NUM_WRITERS;
-    const int NUM_READERS = (readers_calc < 1) ? 1 : readers_calc;
+    const int          NUM_WRITERS = (hw_threads >= 3) ? 2 : 1;
+    int                readers_calc = static_cast<int>(hw_threads) - NUM_WRITERS;
+    const int          NUM_READERS = (readers_calc < 1) ? 1 : readers_calc;
     
-    constexpr auto TEST_DURATION = 15s;
+    constexpr auto     TEST_DURATION = 15s;
 
     std::cout << "Starting Comparative Throughput Test for " << TEST_DURATION.count() << " seconds each..." << std::endl;
     std::cout << "Scenario: " << NUM_READERS << " Readers, " << NUM_WRITERS << " Writers. (Scaled to logical cores)" << std::endl;
@@ -1200,12 +1205,10 @@ void run_comparative_throughput_test()
                             auto        unlock_write_fn, 
                             const char* name) -> WorkloadResult
     {
-        (void)name;
-        
-        std::atomic<bool> run_flag{true};
+        std::atomic<bool>     run_flag{true};
         std::atomic<uint64_t> total_reads{0};
         std::atomic<uint64_t> total_writes{0};
-        std::barrier sync_point(NUM_READERS + NUM_WRITERS + 1);
+        std::barrier          sync_point(NUM_READERS + NUM_WRITERS + 1);
 
         // Stochastic Profiling: Sample 1 out of every 1,000 reads to prevent clock overhead from destroying throughput.
         // Writers are sampled at 100% since their frequency is low enough to not bottleneck the hardware.
@@ -1219,7 +1222,7 @@ void run_comparative_throughput_test()
         {
             uint64_t local_reads = 0;
             uint64_t sample_counter = 0;
-            auto& latencies = thread_reader_latencies[t_idx];
+            auto&    latencies = thread_reader_latencies[t_idx];
             
             // Pre-allocate enough memory to avoid mid-test allocation spikes
             latencies.reserve(200000); 
@@ -1247,15 +1250,14 @@ void run_comparative_throughput_test()
                 unlock_read_fn();
             }
             
-            total_reads.fetch_add(local_reads, 
-                                  std::memory_order_relaxed);
+            total_reads.fetch_add(local_reads, std::memory_order_relaxed);
         };
 
         auto writer_task = [&](int t_idx)
         {
             uint64_t local_writes = 0;
             uint64_t sample_counter = 0;
-            auto& latencies = thread_writer_latencies[t_idx];
+            auto&    latencies = thread_writer_latencies[t_idx];
             
             latencies.reserve(50000);
 
@@ -1284,8 +1286,7 @@ void run_comparative_throughput_test()
                 std::this_thread::sleep_for(1ms);
             }
             
-            total_writes.fetch_add(local_writes, 
-                                   std::memory_order_relaxed);
+            total_writes.fetch_add(local_writes, std::memory_order_relaxed);
         };
 
         std::vector<std::thread> threads;
@@ -1311,8 +1312,14 @@ void run_comparative_throughput_test()
         }
 
         WorkloadResult res;
+        res.name         = name;
         res.total_reads  = total_reads.load();
         res.total_writes = total_writes.load();
+        res.total_ops    = res.total_reads + res.total_writes;
+        
+        double test_secs = static_cast<double>(std::chrono::duration_cast<std::chrono::seconds>(TEST_DURATION).count());
+        res.read_tp      = static_cast<double>(res.total_reads) / test_secs;
+        res.write_tp     = static_cast<double>(res.total_writes) / test_secs;
 
         // Merge thread-local latencies into the global result arrays
         for (const auto& vec : thread_reader_latencies)
@@ -1332,60 +1339,58 @@ void run_comparative_throughput_test()
         return res;
     };
 
+    std::vector<WorkloadResult> results;
+
     // 1. FairRWLock (Our atomic fast-path lock)
     std::cout << "  -> Running FairRWLock (Custom Fairness Policy)..." << std::endl;
     TestFairRWLock<> fair_lock;
-    WorkloadResult fair_results = run_workload([&] { fair_lock.ReadLock(); },
-                                               [&] { fair_lock.ReadUnlock(); },
-                                               [&] { fair_lock.WriteLock(); },
-                                               [&] { fair_lock.WriteUnlock(); },
-                                               "FairRWLock");
+    results.push_back(run_workload([&] { fair_lock.ReadLock(); },
+                                   [&] { fair_lock.ReadUnlock(); },
+                                   [&] { fair_lock.WriteLock(); },
+                                   [&] { fair_lock.WriteUnlock(); },
+                                   "FairRWLock"));
 
     // 2. std::shared_mutex (OS Standard)
     std::cout << "  -> Running std::shared_mutex (OS Native Primitives)..." << std::endl;
     std::shared_mutex std_lock;
-    WorkloadResult std_results = run_workload([&] { std_lock.lock_shared(); },
-                                              [&] { std_lock.unlock_shared(); },
-                                              [&] { std_lock.lock(); },
-                                              [&] { std_lock.unlock(); },
-                                              "std::shared_mutex");
+    results.push_back(run_workload([&] { std_lock.lock_shared(); },
+                                   [&] { std_lock.unlock_shared(); },
+                                   [&] { std_lock.lock(); },
+                                   [&] { std_lock.unlock(); },
+                                   "std::shared_mutex"));
 
     // 3. Textbook Lock (Absolute starvation academic example)
     std::cout << "  -> Running TextbookReaderPrefLock (Standard Mutex/CV)..." << std::endl;
     TextbookReaderPrefLock tb_lock;
-    WorkloadResult tb_results = run_workload([&] { tb_lock.ReadLock(); },
-                                             [&] { tb_lock.ReadUnlock(); },
-                                             [&] { tb_lock.WriteLock(); },
-                                             [&] { tb_lock.WriteUnlock(); },
-                                             "TextbookReaderPrefLock");
+    results.push_back(run_workload([&] { tb_lock.ReadLock(); },
+                                   [&] { tb_lock.ReadUnlock(); },
+                                   [&] { tb_lock.WriteLock(); },
+                                   [&] { tb_lock.WriteUnlock(); },
+                                   "TextbookReaderPrefLock"));
                                              
     // 4. Momentum Lock (Naive Priority Batching example)
     std::cout << "  -> Running MomentumRWLock (Naive Priority Batching Fix)..." << std::endl;
     MomentumRWLock mom_lock;
-    WorkloadResult mom_results = run_workload([&] { mom_lock.ReadLock(INFINITE_TIME); },
-                                              [&] { mom_lock.ReadUnlock(); },
-                                              [&] { mom_lock.WriteLock(INFINITE_TIME); },
-                                              [&] { mom_lock.WriteUnlock(); },
-                                              "MomentumRWLock");
+    results.push_back(run_workload([&] { mom_lock.ReadLock(INFINITE_TIME); },
+                                   [&] { mom_lock.ReadUnlock(); },
+                                   [&] { mom_lock.WriteLock(INFINITE_TIME); },
+                                   [&] { mom_lock.WriteUnlock(); },
+                                   "MomentumRWLock"));
 
-    uint64_t fair_total = fair_results.total_reads + fair_results.total_writes;
-    uint64_t std_total  = std_results.total_reads + std_results.total_writes;
-    uint64_t tb_total   = tb_results.total_reads + tb_results.total_writes;
-    uint64_t mom_total  = mom_results.total_reads + mom_results.total_writes;
+#ifndef _WIN32
+    // 5. pthread_rwlock_t (Standard POSIX native library lock)
+    std::cout << "  -> Running pthread_rwlock_t (POSIX Native Primitives)..." << std::endl;
+    pthread_rwlock_t pt_lock;
+    pthread_rwlock_init(&pt_lock, nullptr);
+    results.push_back(run_workload([&] { pthread_rwlock_rdlock(&pt_lock); },
+                                   [&] { pthread_rwlock_unlock(&pt_lock); },
+                                   [&] { pthread_rwlock_wrlock(&pt_lock); },
+                                   [&] { pthread_rwlock_unlock(&pt_lock); },
+                                   "pthread_rwlock_t"));
+    pthread_rwlock_destroy(&pt_lock);
+#endif
 
-    double test_secs = static_cast<double>(std::chrono::duration_cast<std::chrono::seconds>(TEST_DURATION).count());
-    
-    double fair_read_tp  = static_cast<double>(fair_results.total_reads) / test_secs;
-    double fair_write_tp = static_cast<double>(fair_results.total_writes) / test_secs;
-    double std_read_tp   = static_cast<double>(std_results.total_reads) / test_secs;
-    double std_write_tp  = static_cast<double>(std_results.total_writes) / test_secs;
-    double tb_read_tp    = static_cast<double>(tb_results.total_reads) / test_secs;
-    double tb_write_tp   = static_cast<double>(tb_results.total_writes) / test_secs;
-    double mom_read_tp   = static_cast<double>(mom_results.total_reads) / test_secs;
-    double mom_write_tp  = static_cast<double>(mom_results.total_writes) / test_secs;
-
-    auto calc_percentile = [](const std::vector<double>& sorted_vec, 
-                              double                     p) -> double
+    auto calc_percentile = [](const std::vector<double>& sorted_vec, double p) -> double
     {
         if (sorted_vec.empty())
         {
@@ -1402,38 +1407,81 @@ void run_comparative_throughput_test()
         return sorted_vec[idx];
     };
 
-    std::cout << "\n================================================================================================================" << std::endl;
-    std::cout << "                                          THROUGHPUT COMPARISON MATRIX                                          " << std::endl;
-    std::cout << "================================================================================================================" << std::endl;
-    std::cout << std::left << std::setw(20) << "Metric" 
-              << std::right << std::setw(18) << "FairRWLock" 
-              << std::setw(22) << "std::shared_mutex" 
-              << std::setw(25) << "TextbookReaderPrefLock" 
-              << std::setw(25) << "MomentumRWLock" << std::endl;
-    std::cout << "----------------------------------------------------------------------------------------------------------------" << std::endl;
-    std::cout << std::left << std::setw(20) << "Read Operations"  << std::right << std::setw(18) << fair_results.total_reads  << std::setw(22) << std_results.total_reads  << std::setw(25) << tb_results.total_reads  << std::setw(25) << mom_results.total_reads << std::endl;
-    std::cout << std::left << std::setw(20) << "Write Operations" << std::right << std::setw(18) << fair_results.total_writes << std::setw(22) << std_results.total_writes << std::setw(25) << tb_results.total_writes << std::setw(25) << mom_results.total_writes << std::endl;
-    std::cout << std::left << std::setw(20) << "Total Operations" << std::right << std::setw(18) << fair_total                << std::setw(22) << std_total                << std::setw(25) << tb_total                << std::setw(25) << mom_total << std::endl;
-    std::cout << "----------------------------------------------------------------------------------------------------------------" << std::endl;
-    std::cout << std::fixed << std::setprecision(2);
-    std::cout << std::left << std::setw(20) << "Read Throughput"  << std::right << std::setw(11) << fair_read_tp  << " ops/s" << std::setw(15) << std_read_tp  << " ops/s" << std::setw(18) << tb_read_tp  << " ops/s" << std::setw(18) << mom_read_tp << " ops/s" << std::endl;
-    std::cout << std::left << std::setw(20) << "Write Throughput" << std::right << std::setw(11) << fair_write_tp << " ops/s" << std::setw(15) << std_write_tp << " ops/s" << std::setw(18) << tb_write_tp << " ops/s" << std::setw(18) << mom_write_tp << " ops/s" << std::endl;
+    // ------------------------------------------------------------------------
+    // Dynamic Matrix Printing
+    // ------------------------------------------------------------------------
+    int first_col_width = 20;
+    int col_width       = 25;
+    int total_width     = first_col_width + static_cast<int>(results.size()) * col_width;
     
-    std::cout << "\n================================================================================================================" << std::endl;
-    std::cout << "                                   LATENCY DISTRIBUTION MATRIX (Nanoseconds)                                    " << std::endl;
-    std::cout << "================================================================================================================" << std::endl;
-    std::cout << std::left << std::setw(20) << "Reader p50 (Median)" << std::right << std::setw(18) << calc_percentile(fair_results.reader_latencies_ns, 0.50)   << std::setw(22) << calc_percentile(std_results.reader_latencies_ns, 0.50)   << std::setw(25) << calc_percentile(tb_results.reader_latencies_ns, 0.50)   << std::setw(25) << calc_percentile(mom_results.reader_latencies_ns, 0.50) << std::endl;
-    std::cout << std::left << std::setw(20) << "Reader p95"          << std::right << std::setw(18) << calc_percentile(fair_results.reader_latencies_ns, 0.95)   << std::setw(22) << calc_percentile(std_results.reader_latencies_ns, 0.95)   << std::setw(25) << calc_percentile(tb_results.reader_latencies_ns, 0.95)   << std::setw(25) << calc_percentile(mom_results.reader_latencies_ns, 0.95) << std::endl;
-    std::cout << std::left << std::setw(20) << "Reader p99.9"        << std::right << std::setw(18) << calc_percentile(fair_results.reader_latencies_ns, 0.999)  << std::setw(22) << calc_percentile(std_results.reader_latencies_ns, 0.999)  << std::setw(25) << calc_percentile(tb_results.reader_latencies_ns, 0.999)  << std::setw(25) << calc_percentile(mom_results.reader_latencies_ns, 0.999) << std::endl;
-    std::cout << std::left << std::setw(20) << "Reader p99.99"       << std::right << std::setw(18) << calc_percentile(fair_results.reader_latencies_ns, 0.9999) << std::setw(22) << calc_percentile(std_results.reader_latencies_ns, 0.9999) << std::setw(25) << calc_percentile(tb_results.reader_latencies_ns, 0.9999) << std::setw(25) << calc_percentile(mom_results.reader_latencies_ns, 0.9999) << std::endl;
-    std::cout << std::left << std::setw(20) << "Reader Max"          << std::right << std::setw(18) << calc_percentile(fair_results.reader_latencies_ns, 1.0)    << std::setw(22) << calc_percentile(std_results.reader_latencies_ns, 1.0)    << std::setw(25) << calc_percentile(tb_results.reader_latencies_ns, 1.0)    << std::setw(25) << calc_percentile(mom_results.reader_latencies_ns, 1.0) << std::endl;
-    std::cout << "----------------------------------------------------------------------------------------------------------------" << std::endl;
-    std::cout << std::left << std::setw(20) << "Writer p50 (Median)" << std::right << std::setw(18) << calc_percentile(fair_results.writer_latencies_ns, 0.50)   << std::setw(22) << calc_percentile(std_results.writer_latencies_ns, 0.50)   << std::setw(25) << calc_percentile(tb_results.writer_latencies_ns, 0.50)   << std::setw(25) << calc_percentile(mom_results.writer_latencies_ns, 0.50) << std::endl;
-    std::cout << std::left << std::setw(20) << "Writer p95"          << std::right << std::setw(18) << calc_percentile(fair_results.writer_latencies_ns, 0.95)   << std::setw(22) << calc_percentile(std_results.writer_latencies_ns, 0.95)   << std::setw(25) << calc_percentile(tb_results.writer_latencies_ns, 0.95)   << std::setw(25) << calc_percentile(mom_results.writer_latencies_ns, 0.95) << std::endl;
-    std::cout << std::left << std::setw(20) << "Writer p99.9"        << std::right << std::setw(18) << calc_percentile(fair_results.writer_latencies_ns, 0.999)  << std::setw(22) << calc_percentile(std_results.writer_latencies_ns, 0.999)  << std::setw(25) << calc_percentile(tb_results.writer_latencies_ns, 0.999)  << std::setw(25) << calc_percentile(mom_results.writer_latencies_ns, 0.999) << std::endl;
-    std::cout << std::left << std::setw(20) << "Writer p99.99"       << std::right << std::setw(18) << calc_percentile(fair_results.writer_latencies_ns, 0.9999) << std::setw(22) << calc_percentile(std_results.writer_latencies_ns, 0.9999) << std::setw(25) << calc_percentile(tb_results.writer_latencies_ns, 0.9999) << std::setw(25) << calc_percentile(mom_results.writer_latencies_ns, 0.9999) << std::endl;
-    std::cout << std::left << std::setw(20) << "Writer Max"          << std::right << std::setw(18) << calc_percentile(fair_results.writer_latencies_ns, 1.0)    << std::setw(22) << calc_percentile(std_results.writer_latencies_ns, 1.0)    << std::setw(25) << calc_percentile(tb_results.writer_latencies_ns, 1.0)    << std::setw(25) << calc_percentile(mom_results.writer_latencies_ns, 1.0) << std::endl;
-    std::cout << "================================================================================================================\n" << std::endl; 
+    std::string sep_eq(total_width, '=');
+    std::string sep_dash(total_width, '-');
+
+    auto print_centered = [&](const std::string& text)
+    {
+        int padding = std::max<int>(0, (total_width - static_cast<int>(text.length())) / 2);
+        std::cout << std::string(padding, ' ') << text << std::endl;
+    };
+
+    auto print_row = [&](const std::string& metric, auto ext)
+    {
+        std::cout << std::left << std::setw(first_col_width) << metric;
+        
+        for (const auto& res : results)
+        {
+            std::cout << std::right << std::setw(col_width) << ext(res);
+        }
+        
+        std::cout << std::endl;
+    };
+
+    std::cout << "\n" << sep_eq << std::endl;
+    print_centered("THROUGHPUT COMPARISON MATRIX");
+    std::cout << sep_eq << std::endl;
+    
+    print_row("Metric", [](const WorkloadResult& r) { return r.name; });
+    std::cout << sep_dash << std::endl;
+    
+    print_row("Read Operations", [](const WorkloadResult& r) { return r.total_reads; });
+    print_row("Write Operations", [](const WorkloadResult& r) { return r.total_writes; });
+    print_row("Total Operations", [](const WorkloadResult& r) { return r.total_ops; });
+    std::cout << sep_dash << std::endl;
+    
+    std::cout << std::fixed << std::setprecision(2);
+    
+    print_row("Read Throughput", [](const WorkloadResult& r) 
+    {
+        std::ostringstream oss;
+        oss << std::fixed << std::setprecision(2) << r.read_tp << " ops/s";
+        return oss.str();
+    });
+    
+    print_row("Write Throughput", [](const WorkloadResult& r) 
+    {
+        std::ostringstream oss;
+        oss << std::fixed << std::setprecision(2) << r.write_tp << " ops/s";
+        return oss.str();
+    });
+
+    std::cout << "\n" << sep_eq << std::endl;
+    print_centered("LATENCY DISTRIBUTION MATRIX (Nanoseconds)");
+    std::cout << sep_eq << std::endl;
+    
+    print_row("Reader p50 (Median)", [&](const WorkloadResult& r) { return calc_percentile(r.reader_latencies_ns, 0.50); });
+    print_row("Reader p95",          [&](const WorkloadResult& r) { return calc_percentile(r.reader_latencies_ns, 0.95); });
+    print_row("Reader p99.9",        [&](const WorkloadResult& r) { return calc_percentile(r.reader_latencies_ns, 0.999); });
+    print_row("Reader p99.99",       [&](const WorkloadResult& r) { return calc_percentile(r.reader_latencies_ns, 0.9999); });
+    print_row("Reader Max",          [&](const WorkloadResult& r) { return calc_percentile(r.reader_latencies_ns, 1.0); });
+    
+    std::cout << sep_dash << std::endl;
+    
+    print_row("Writer p50 (Median)", [&](const WorkloadResult& r) { return calc_percentile(r.writer_latencies_ns, 0.50); });
+    print_row("Writer p95",          [&](const WorkloadResult& r) { return calc_percentile(r.writer_latencies_ns, 0.95); });
+    print_row("Writer p99.9",        [&](const WorkloadResult& r) { return calc_percentile(r.writer_latencies_ns, 0.999); });
+    print_row("Writer p99.99",       [&](const WorkloadResult& r) { return calc_percentile(r.writer_latencies_ns, 0.9999); });
+    print_row("Writer Max",          [&](const WorkloadResult& r) { return calc_percentile(r.writer_latencies_ns, 1.0); });
+    
+    std::cout << sep_eq << "\n" << std::endl;
     
     log_result("Comparative Throughput Test (Completed)", true);
 }
@@ -1558,20 +1606,91 @@ struct MomentumLockAdapter
     }
 };
 
+#ifndef _WIN32
 // ----------------------------------------------------------------------------
-// Simulates an extreme reader oversubscription scenario using active 
-// CPU spin-waits inside read locks to guarantee continuous read overlaps.
-// Used to test if lock implementations suffer from strict writer starvation
+// Linux/macOS POSIX adapter. Accommodates for native try_lock logic using
+// timed backoffs since pthread_rwlock_timedwrlock is not uniformly supported
+// across all POSIX architectures (e.g. missing on standard macOS headers).
+// ----------------------------------------------------------------------------
+struct PthreadLockAdapter
+{
+    pthread_rwlock_t lock;
+    
+    PthreadLockAdapter()
+    {
+        pthread_rwlock_init(&lock, nullptr);
+    }
+    
+    ~PthreadLockAdapter()
+    {
+        pthread_rwlock_destroy(&lock);
+    }
+    
+    void lock_shared() 
+    { 
+        pthread_rwlock_rdlock(&lock); 
+    }
+    
+    void unlock_shared() 
+    { 
+        pthread_rwlock_unlock(&lock); 
+    }
+    
+    bool try_lock_for(std::chrono::milliseconds ms) 
+    { 
+        auto start = std::chrono::steady_clock::now();
+        
+        while (true)
+        {
+            if (pthread_rwlock_trywrlock(&lock) == 0)
+            {
+                return true;
+            }
+            
+            if (std::chrono::steady_clock::now() - start >= ms)
+            {
+                return false;
+            }
+            
+            // Active spin-wait with yield to simulate timed wait without blocking entirely
+            // Hardware pause mitigates hyper-thread instruction starvation 
+            for (int k = 0; k < 10; ++k)
+            {
+#if defined(__aarch64__) || defined(__arm__)
+                __asm__ volatile("yield" ::: "memory");
+#elif defined(__x86_64__) || defined(__i386__)
+                __builtin_ia32_pause();
+#else
+                std::atomic_signal_fence(std::memory_order_seq_cst);
+#endif
+            }
+            
+            std::this_thread::yield();
+        }
+    }
+    
+    void unlock() 
+    { 
+        pthread_rwlock_unlock(&lock); 
+    }
+};
+#endif
+
+// ----------------------------------------------------------------------------
+// Unified core workload abstraction for both starvation tests to eliminate 
+// active reader spin-wait code duplication.
 // ----------------------------------------------------------------------------
 template <typename LockAdapter>
-bool execute_starvation_test(const char* lock_name)
+bool execute_starvation_workload(const char* lock_name,
+                                 LockAdapter& rwlock,
+                                 int          num_write_attempts,
+                                 bool         print_each_attempt)
 {
-    LockAdapter rwlock;
     std::atomic<bool> running{true};
-    std::atomic<int> readers_ready{0};
-
+    std::atomic<int>  readers_ready{0};
+    
     // Heavily oversubscribe the CPU to guarantee overlapping read intervals
-    const int num_readers = std::max<int>(16, get_hw_threads() * 2);
+    const int         num_readers = std::max<int>(16, get_hw_threads() * 2);
     
     auto reader_func = [&]()
     {
@@ -1616,11 +1735,18 @@ bool execute_starvation_test(const char* lock_name)
     
     std::this_thread::sleep_for(200ms);
 
-    std::cout << "  -> Testing: " << lock_name << " (" << num_readers << " aggressive readers)\n";
+    if (print_each_attempt)
+    {
+        std::cout << "  -> Testing 2-Second Timeout Starvation: " << lock_name 
+                  << " (" << num_readers << " aggressive readers)\n";
+    }
+    else
+    {
+        std::cout << "  -> Testing: " << lock_name << " (" << num_readers << " aggressive readers)\n";
+    }
 
-    const int num_write_attempts = 5;
-    const auto timeout_limit = 2000ms;
-    int successful_acquisitions = 0;
+    const auto          timeout_limit = 2000ms;
+    int                 successful_acquisitions = 0;
     std::vector<double> wait_times_ms;
 
     for (int i = 0; i < num_write_attempts; ++i)
@@ -1631,6 +1757,11 @@ bool execute_starvation_test(const char* lock_name)
         
         auto end = std::chrono::high_resolution_clock::now();
         std::chrono::duration<double, std::milli> wait_ms = end - start;
+
+        if (print_each_attempt)
+        {
+            std::cout << "     Attempt " << (i + 1) << " Wait Time: " << std::fixed << std::setprecision(2) << wait_ms.count() << " ms | Acquired: " << (acquired ? "Yes" : "No") << "\n";
+        }
 
         if (acquired)
         {
@@ -1651,20 +1782,46 @@ bool execute_starvation_test(const char* lock_name)
         t.join();
     }
     
-    if (!wait_times_ms.empty())
+    if (!print_each_attempt)
     {
-        double max_wait = *std::max_element(wait_times_ms.begin(), wait_times_ms.end());
-        double sum_wait = std::accumulate(wait_times_ms.begin(), wait_times_ms.end(), 0.0);
-        double avg_wait = sum_wait / wait_times_ms.size();
+        if (!wait_times_ms.empty())
+        {
+            double max_wait = *std::max_element(wait_times_ms.begin(), wait_times_ms.end());
+            double sum_wait = std::accumulate(wait_times_ms.begin(), wait_times_ms.end(), 0.0);
+            double avg_wait = sum_wait / wait_times_ms.size();
 
-        std::cout << "     Results: Average Wait = " << std::fixed << std::setprecision(2) << avg_wait << " ms | Max Wait = " << max_wait << " ms\n";
-    }
-    else
-    {
-        std::cout << "     Results: 100% Starvation Rate. Writer never acquired the lock.\n";
+            std::cout << "     Results: Average Wait = " << std::fixed << std::setprecision(2) << avg_wait << " ms | Max Wait = " << max_wait << " ms\n";
+        }
+        else
+        {
+            std::cout << "     Results: 100% Starvation Rate. Writer never acquired the lock.\n";
+        }
     }
 
     return (successful_acquisitions == num_write_attempts);
+}
+
+// ----------------------------------------------------------------------------
+// Simulates an extreme reader oversubscription scenario to test if lock 
+// implementations suffer from strict writer starvation.
+// ----------------------------------------------------------------------------
+template <typename LockAdapter>
+bool execute_starvation_test(const char* lock_name)
+{
+    LockAdapter rwlock;
+    return execute_starvation_workload(lock_name, rwlock, 5, false);
+}
+
+// ----------------------------------------------------------------------------
+// Simulates a severe environment where writers have a rigid 2-second 
+// deadline, proving that starvation-protection mechanisms successfully complete 
+// the acquisition before timeout occurs.
+// ----------------------------------------------------------------------------
+template <typename LockAdapter>
+void execute_timeout_starvation_test(const char* lock_name)
+{
+    LockAdapter rwlock;
+    execute_starvation_workload(lock_name, rwlock, 3, true);
 }
 
 // ----------------------------------------------------------------------------
@@ -1680,109 +1837,27 @@ void writer_starvation_comparison_test()
     bool fair_passed = execute_starvation_test<FairLockAdapter>("FairRWLock");
 
     std::cout << "-------------------------------------------------------------------" << std::endl;
-    
     execute_starvation_test<StdTimedAdapter>("std::shared_timed_mutex");
     
     std::cout << "-------------------------------------------------------------------" << std::endl;
-
     execute_starvation_test<TextbookLockAdapter>("TextbookReaderPrefLock");
     
     std::cout << "-------------------------------------------------------------------" << std::endl;
-
     execute_starvation_test<MomentumLockAdapter>("MomentumRWLock");
     
+#ifndef _WIN32
+    std::cout << "-------------------------------------------------------------------" << std::endl;
+    execute_starvation_test<PthreadLockAdapter>("pthread_rwlock_t");
+#endif
+
     std::cout << "===================================================================\n" << std::endl;
 
     log_result("Writer Starvation Comparison Benchmark (Passed = Fair) ", fair_passed);
 }
 
 // ----------------------------------------------------------------------------
-// Simulates a severe environment where writers have a rigid 2-second 
-// deadline, proving that starvation-protection mechanisms successfully complete 
-// the acquisition before timeout occurs.
-// ----------------------------------------------------------------------------
-template <typename LockAdapter>
-void execute_timeout_starvation_test(const char* lock_name)
-{
-    LockAdapter rwlock;
-    std::atomic<bool> running{true};
-    std::atomic<int> readers_ready{0};
-
-    // Heavily oversubscribe to simulate a true continuous read lock threshold
-    const int num_readers = std::max<int>(16, get_hw_threads() * 2);
-    
-    auto reader_func = [&]()
-    {
-        readers_ready.fetch_add(1, std::memory_order_relaxed);
-        
-        while (running.load(std::memory_order_relaxed))
-        {
-            rwlock.lock_shared();
-            
-            auto start = std::chrono::high_resolution_clock::now();
-            
-            while (std::chrono::high_resolution_clock::now() - start < 500us)
-            {
-                // Active spin-wait keeps the lock highly contested
-                cpu_relax_pause();
-            }
-            
-            rwlock.unlock_shared();
-            std::this_thread::yield();
-        }
-    };
-
-    std::vector<std::thread> readers;
-    
-    for (int i = 0; i < num_readers; ++i)
-    {
-        readers.emplace_back(reader_func);
-    }
-
-    while (readers_ready.load(std::memory_order_relaxed) < num_readers)
-    {
-        std::this_thread::yield();
-    }
-    
-    std::this_thread::sleep_for(200ms);
-
-    std::cout << "  -> Testing 2-Second Timeout Starvation: " << lock_name 
-              << " (" << num_readers << " aggressive readers)\n";
-
-    const int num_write_attempts = 3;
-    const auto timeout_limit = std::chrono::milliseconds(2000);
-
-    for (int i = 0; i < num_write_attempts; ++i)
-    {
-        auto start = std::chrono::high_resolution_clock::now();
-        
-        bool acquired = rwlock.try_lock_for(timeout_limit);
-        
-        auto end = std::chrono::high_resolution_clock::now();
-        std::chrono::duration<double, std::milli> wait_ms = end - start;
-
-        std::cout << "     Attempt " << (i + 1) << " Wait Time: " << std::fixed << std::setprecision(2) << wait_ms.count() << " ms | Acquired: " << (acquired ? "Yes" : "No") << "\n";
-
-        if (acquired)
-        {
-            std::this_thread::sleep_for(1ms);
-            rwlock.unlock();
-        }
-
-        std::this_thread::sleep_for(100ms);
-    }
-
-    running.store(false, std::memory_order_relaxed);
-    
-    for (auto& t : readers)
-    {
-        t.join();
-    }
-}
-
-// ----------------------------------------------------------------------------
 // Executes the `execute_timeout_starvation_test` helper sequentially 
-// across all four lock variants to observe failure states.
+// across all lock variants to observe failure states.
 // ----------------------------------------------------------------------------
 void writer_timeout_starvation_test()
 {
@@ -1791,12 +1866,20 @@ void writer_timeout_starvation_test()
     std::cout << "=========================================================================================" << std::endl;
         
     execute_timeout_starvation_test<FairLockAdapter>("FairRWLock");
+    
     std::cout << "-----------------------------------------------------------------------------------------" << std::endl;
     execute_timeout_starvation_test<StdTimedAdapter>("std::shared_timed_mutex");
+    
     std::cout << "-----------------------------------------------------------------------------------------" << std::endl;
     execute_timeout_starvation_test<TextbookLockAdapter>("TextbookReaderPrefLock");
+    
     std::cout << "-----------------------------------------------------------------------------------------" << std::endl;
     execute_timeout_starvation_test<MomentumLockAdapter>("MomentumRWLock");
+
+#ifndef _WIN32
+    std::cout << "-----------------------------------------------------------------------------------------" << std::endl;
+    execute_timeout_starvation_test<PthreadLockAdapter>("pthread_rwlock_t");
+#endif
 
     std::cout << "=========================================================================================\n" << std::endl;
     log_result("Writer 2-Second Timeout Starvation Test", true);
@@ -1806,9 +1889,9 @@ struct SweepResult
 {
     std::string config_name;
     std::string policy_info;
-    double read_tp;
-    double write_tp;
-    uint64_t total_ops;
+    double      read_tp;
+    double      write_tp;
+    uint64_t    total_ops;
 };
 
 // ----------------------------------------------------------------------------
@@ -1862,7 +1945,7 @@ static void print_wrapped_text(const std::string& label,
     size_t available_width = (max_width > indent) ? (max_width - indent) : 40;
 
     size_t start = 0;
-    bool first_line = true;
+    bool   first_line = true;
 
     while (start < text.length())
     {
@@ -1926,11 +2009,11 @@ static void print_wrapped_text(const std::string& label,
 void policy_parameter_sweep_benchmark()
 {
     const unsigned int hw_threads = get_hw_threads();
-    const int NUM_WRITERS = (hw_threads >= 3) ? 2 : 1;
-    int readers_calc = static_cast<int>(hw_threads) - NUM_WRITERS;
-    const int NUM_READERS = (readers_calc < 1) ? 1 : readers_calc;
+    const int          NUM_WRITERS = (hw_threads >= 3) ? 2 : 1;
+    int                readers_calc = static_cast<int>(hw_threads) - NUM_WRITERS;
+    const int          NUM_READERS = (readers_calc < 1) ? 1 : readers_calc;
     
-    constexpr auto TEST_DURATION = 10s; 
+    constexpr auto     TEST_DURATION = 10s; 
 
     // Define policy behavioral descriptions ("It tells the lock / platform:") using constexpr string views
     constexpr std::string_view DESC_DEFAULT = 
@@ -1992,8 +2075,7 @@ void policy_parameter_sweep_benchmark()
                 unlock_read_fn();
             }
             
-            total_reads.fetch_add(local_reads, 
-                                  std::memory_order_relaxed);
+            total_reads.fetch_add(local_reads, std::memory_order_relaxed);
         };
 
         auto writer_task = [&]()
@@ -2010,8 +2092,7 @@ void policy_parameter_sweep_benchmark()
                 std::this_thread::sleep_for(1ms);
             }
             
-            total_writes.fetch_add(local_writes, 
-                                   std::memory_order_relaxed);
+            total_writes.fetch_add(local_writes, std::memory_order_relaxed);
         };
 
         std::vector<std::thread> threads;
@@ -2032,8 +2113,8 @@ void policy_parameter_sweep_benchmark()
 
         sync_point.arrive_and_wait();
         std::this_thread::sleep_for(TEST_DURATION);
-        run_flag.store(false, 
-                       std::memory_order_relaxed);
+        
+        run_flag.store(false, std::memory_order_relaxed);
 
         for (auto& t : threads)
         {
@@ -2126,6 +2207,19 @@ void policy_parameter_sweep_benchmark()
                                    "7. Momentum (Batching Fix)", 
                                    "N/A (Momentum-based priority flip-flops)",
                                    DESC_MOMENTUM));
+                                   
+#ifndef _WIN32
+    pthread_rwlock_t pt_sweep_lock;
+    pthread_rwlock_init(&pt_sweep_lock, nullptr);
+    results.push_back(run_workload([&] { pthread_rwlock_rdlock(&pt_sweep_lock); }, 
+                                   [&] { pthread_rwlock_unlock(&pt_sweep_lock); },
+                                   [&] { pthread_rwlock_wrlock(&pt_sweep_lock); }, 
+                                   [&] { pthread_rwlock_unlock(&pt_sweep_lock); },
+                                   "8. POSIX Native (pthread_rwlock_t)", 
+                                   "N/A (OS Managed, Usually Reader-Pref)",
+                                   "Manage thread arbitration entirely through standard POSIX pthread library."));
+    pthread_rwlock_destroy(&pt_sweep_lock);
+#endif
 
     double baseline_total_ops = static_cast<double>(results[4].total_ops);
 
@@ -2181,14 +2275,14 @@ struct ConsecHammerPolicy : DefaultFairRWLockPolicy
 void consecutive_limit_hammer_test()
 {
     TestFairRWLock<ConsecHammerPolicy> lock;
-    std::atomic<bool> running{true};
-    std::atomic<int> consec_writes{0};
-    std::atomic<int> max_consec_writes{0};
-    std::atomic<bool> limit_breached{false};
+    std::atomic<bool>                  running{true};
+    std::atomic<int>                   consec_writes{0};
+    std::atomic<int>                   max_consec_writes{0};
+    std::atomic<bool>                  limit_breached{false};
 
     const unsigned int hw_threads = get_hw_threads();
-    const int NUM_THREADS = std::max<int>(4u, hw_threads * 2); 
-    std::barrier sync(NUM_THREADS * 2 + 1);
+    const int          NUM_THREADS = std::max<int>(4u, hw_threads * 2); 
+    std::barrier       sync(NUM_THREADS * 2 + 1);
 
     auto writer_task = [&]()
     {
@@ -2282,13 +2376,13 @@ struct OverrideStarveHammerPolicy : DefaultFairRWLockPolicy
 void override_starvation_hammer_test()
 {
     TestFairRWLock<OverrideStarveHammerPolicy> lock;
-    std::atomic<bool> running{true};
-    std::atomic<bool> writer_starved{false};
+    std::atomic<bool>                          running{true};
+    std::atomic<bool>                          writer_starved{false};
 
     const unsigned int hw_threads = get_hw_threads();
-    const int NUM_WRITERS = std::max<int>(2u, hw_threads / 4);
-    const int NUM_READERS = std::max<int>(4u, hw_threads * 2); // Deliberate oversubscription
-    std::barrier sync(NUM_READERS + NUM_WRITERS + 1);
+    const int          NUM_WRITERS = std::max<int>(2u, hw_threads / 4);
+    const int          NUM_READERS = std::max<int>(4u, hw_threads * 2); // Deliberate oversubscription
+    std::barrier       sync(NUM_READERS + NUM_WRITERS + 1);
 
     auto reader_task = [&]()
     {
@@ -2542,6 +2636,7 @@ struct PersistencePolicy : DefaultFairRWLockPolicy
 int main()
 {
 #ifdef _WIN32
+    SetConsoleOutputCP(CP_UTF8);
     MMRESULT Res = timeBeginPeriod(1);
 #endif
 
@@ -2600,17 +2695,17 @@ int main()
     std::cout << std::endl;
 
     const unsigned int hw_threads = get_hw_threads();
-    const int NUM_WRITERS = (hw_threads >= 3) ? 2 : 1;
-    int readers_calc = static_cast<int>(hw_threads) - NUM_WRITERS;
-    const int NUM_READERS = (readers_calc < 1) ? 1 : readers_calc;
+    const int          NUM_WRITERS = (hw_threads >= 3) ? 2 : 1;
+    int                readers_calc = static_cast<int>(hw_threads) - NUM_WRITERS;
+    const int          NUM_READERS = (readers_calc < 1) ? 1 : readers_calc;
     
-    constexpr auto TEST_DURATION = 10s;
+    constexpr auto     TEST_DURATION = 10s;
 
     bool all_checks_passed = true;
 
     TestFairRWLock<PersistencePolicy> lock;
 
-    SharedData shared_data;
+    SharedData        shared_data;
     std::atomic<long> read_operations  = 0;
     std::atomic<long> write_operations = 0;
     std::atomic<bool> stop_flag        = false;
